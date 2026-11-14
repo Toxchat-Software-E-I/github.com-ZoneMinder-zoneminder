@@ -112,7 +112,6 @@ $serial = $primary_key = 'Id';
   EncoderParameters
   RecordAudio
   RecordingSource
-  RTSPDescribe
   Brightness
   Contrast
   Hue
@@ -238,7 +237,6 @@ $fields{model} = undef;
     EncoderParameters => '',
     RecordAudio=>0,
     RecordingSource  => q`'Primary'`,
-    RTSPDescribe=>0,
     Brightness  =>  -1,
     Contrast    =>  -1,
     Hue         =>  -1,
@@ -469,7 +467,7 @@ sub resumeMotionDetection {
   return if $$self{Capturing} eq 'None' or $$self{Analysing} eq 'None';
   ZoneMinder::Logger::Debug(1, "capturing: $$self{Capturing} analysing: $$self{Analysing}");
   my $count = 50;
-  while ($count and !ZoneMinder::Memory::zmMemRead($self, 'shared_data:analysing', 1)) {
+  while ($count and ZoneMinder::Memory::zmMemRead($self, 'shared_data:analysing', 1) == ANALYSING_NONE) {
     ZoneMinder::Logger::Debug(1, 'Resuming motion detection');
     ZoneMinder::Memory::zmMonitorResume($self);
     usleep(100000);
@@ -501,6 +499,7 @@ sub Control {
           return undef;
         }
         $Control = $Control->clone(); # Because this object is not per monitor specific
+        $$Control{Protocol} = $Protocol;
         bless $Control, 'ZoneMinder::Control::'.$Protocol;
         $$Control{MonitorId} = $$self{Id};
         $$Control{Monitor} = $self->clone();

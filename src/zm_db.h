@@ -23,11 +23,14 @@
 #include <condition_variable>
 #include <cstdint>
 #include <mutex>
-#include <mysql/mysql.h>
-#include <mysql/mysqld_error.h>
+// MYSQLCLIENT_INCLUDE_DIR (CMakeLists.txt) is on the include path: the headers'
+// directory is include/mysql for libmysqlclient and include/mariadb for libmariadb.
+#include <mysql.h>
+#include <mysqld_error.h>
 #include <queue>
 #include <string>
 #include <thread>
+#include <utility>
 #include <unistd.h>
 
 // How many times a query that lost a lock race is re-run before being
@@ -45,7 +48,8 @@ useconds_t zmDbContentionBackoff(int attempt);
 
 class zmDbQueue {
  private:
-  std::queue<std::string> mQueue;
+  // The flag marks rows the logger queued (inserts into Logs).
+  std::queue<std::pair<std::string, bool>> mQueue;
   std::thread             mThread;
   std::mutex              mMutex;
   std::condition_variable mCondition;
@@ -53,7 +57,7 @@ class zmDbQueue {
  public:
   zmDbQueue();
   ~zmDbQueue();
-  void push(std::string &&sql);
+  void push(std::string &&sql, bool log_row = false);
   void process();
   void stop();
 };

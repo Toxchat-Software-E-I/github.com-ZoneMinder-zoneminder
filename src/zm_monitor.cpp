@@ -28,8 +28,6 @@
 #include "zm_mqtt.h"
 #include "zm_remote_camera.h"
 #include "zm_remote_camera_http.h"
-#include "zm_remote_camera_nvsocket.h"
-#include "zm_remote_camera_rtsp.h"
 #include "zm_signal.h"
 #include "zm_stream_socket.h"
 #include "zm_time.h"
@@ -40,10 +38,6 @@
 #if ZM_HAS_V4L2
 #include "zm_local_camera.h"
 #endif  // ZM_HAS_V4L2
-
-#if HAVE_LIBVLC
-#include "zm_libvlc_camera.h"
-#endif  // HAVE_LIBVLC
 
 #if HAVE_LIBVNC
 #include "zm_libvnc_camera.h"
@@ -95,7 +89,7 @@ std::string load_monitor_sql =
   "`Protocol`, `Method`, `Options`, `User`, `Pass`, `Host`, `Port`, `Path`, "
   "`SecondPath`, `Width`, `Height`, `Colours`, `Palette`, `Orientation`+0, "
   "`Deinterlacing`, "
-  "`Decoder`, `DecoderHWAccelName`, `DecoderHWAccelDevice`, `RTSPDescribe`, "
+  "`Decoder`, `DecoderHWAccelName`, `DecoderHWAccelDevice`, "
   "`SaveJPEGs`, `VideoWriter`, `EncoderParameters`, "
   "`OutputCodecName`, `Encoder`, `EncoderHWAccelName`, `EncoderHWAccelDevice`, `OutputContainer`, "
   "`RecordAudio`, WallClockTimestamps,"
@@ -115,19 +109,24 @@ std::string load_monitor_sql =
   ", `MQTT_Enabled`, `MQTT_Subscriptions`"
 #endif
   ", `StartupDelay`"
-  ", `AudioDetection`, `AudioThreshold`, `AudioAlarmScore`"
+  ", `AudioDetection`, `AudioThreshold`, `AudioAlarmScore`, `DeviceClass`, `Go2RTCDisableBackChannel`"
   " FROM `Monitors`";
 
+// Indexed by Monitor::CameraType, which starts at 1, so entry 0 covers the
+// unset value. The static_assert is what keeps this honest: the table silently
+// lost its LibCURL entry once already, which shifted every later name onto the
+// wrong type and put VNC one past the end.
 std::string CameraType_Strings[] = {
   "Unknown",
   "Local",
   "Remote",
   "File",
   "Ffmpeg",
-  "LibVLC",
-  "NVSOCKET",
+  "LibCURL",
   "VNC"
 };
+static_assert(sizeof(CameraType_Strings)/sizeof(CameraType_Strings[0]) == Monitor::VNC + 1,
+              "CameraType_Strings must have one entry per Monitor::CameraType, plus entry 0");
 
 std::string State_Strings[] = {
   "Unknown",
@@ -189,6 +188,7 @@ Monitor::Monitor() :
   RTSP2Web_enabled(false),
   RTSP2Web_type(WEBRTC),
   Go2RTC_enabled(false),
+  Go2RTC_disable_backchannel(true),
   janus_enabled(false),
   janus_audio_enabled(false),
   janus_profile_override(""),
@@ -219,8 +219,10 @@ Monitor::Monitor() :
   deinterlacing_value(0),
   decoder_hwaccel_name(""),
   decoder_hwaccel_device(""),
+  mVideoCodecContext(nullptr),
+  decoder_hw_pix_fmt(AV_PIX_FMT_NONE),
+  decoder_hw_device_ctx(nullptr),
   videoRecording(false),
-  rtsp_describe(false),
 
   savejpegs(0),
   colours(0),
@@ -274,6 +276,7 @@ Monitor::Monitor() :
   onvif_alarm_txt(""),
   importance(0),
   zone_count(0),
+  zones_loaded(true),
   capture_max_fps(0),
   purpose(QUERY),
   last_camera_bytes(0),
@@ -288,6 +291,7 @@ Monitor::Monitor() :
   first_alarm_count(0),
   last_alarm_count(0),
   last_signal(false),
+  assume_signal_on_next_packet(false),
   buffer_count(0),
   state(IDLE),
   last_motion_score(0),
@@ -325,6 +329,7 @@ Monitor::Monitor() :
   // mqtt_subscriptions,
   mqtt(nullptr),
 #endif
+  privacy_image(nullptr),
   privacy_bitmask(nullptr),
   //linked_monitors_string
   n_linked_monitors(0),
@@ -339,6 +344,8 @@ Monitor::Monitor() :
   green_val(0),
   blue_val(0),
   grayscale_val(0),
+  luma_val(0),
+  luma_full_val(0),
   colour_val(0) {
   if (strcmp(config.event_close_mode, "time") == 0) {
     event_close_mode = CLOSE_TIME;
@@ -361,6 +368,7 @@ Monitor::Monitor() :
 
 
 void Monitor::Load(MYSQL_ROW dbrow, bool load_zones=true, Purpose p = QUERY) {
+  zones_loaded = load_zones;
   purpose = p;
   int col = 0;
 
@@ -386,10 +394,6 @@ void Monitor::Load(MYSQL_ROW dbrow, bool load_zones=true, Purpose p = QUERY) {
     type = REMOTE;
   } else if (!strcmp(dbrow[col], "File")) {
     type = FILE;
-  } else if (!strcmp(dbrow[col], "NVSocket")) {
-    type = NVSOCKET;
-  } else if (!strcmp(dbrow[col], "Libvlc")) {
-    type = LIBVLC;
   } else if (!strcmp(dbrow[col], "VNC")) {
     type = VNC;
   } else {
@@ -519,14 +523,12 @@ void Monitor::Load(MYSQL_ROW dbrow, bool load_zones=true, Purpose p = QUERY) {
   col++;
   deinterlacing_value = deinterlacing & 0xff;
 
-  /*"`Decoder`, `DecoderHWAccelName`, `DecoderHWAccelDevice`, `RTSPDescribe`, " */
+  /*"`Decoder`, `DecoderHWAccelName`, `DecoderHWAccelDevice`, " */
   decoder_name = dbrow[col] ? dbrow[col] : "";
   col++;
   decoder_hwaccel_name = dbrow[col] ? dbrow[col] : "";
   col++;
   decoder_hwaccel_device = dbrow[col] ? dbrow[col] : "";
-  col++;
-  rtsp_describe = (dbrow[col] && *dbrow[col] != '0');
   col++;
 
 
@@ -711,6 +713,9 @@ void Monitor::Load(MYSQL_ROW dbrow, bool load_zones=true, Purpose p = QUERY) {
   green_val = GREEN_VAL_BGRA(signal_check_colour);
   blue_val = BLUE_VAL_BGRA(signal_check_colour);
   grayscale_val = signal_check_colour & 0xff;  /* Clear all bytes but lowest byte */
+  // What a 1-byte-per-pixel (Y plane or GRAY8) capture of that colour holds.
+  luma_val = rgb_to_luma(red_val, green_val, blue_val, false);
+  luma_full_val = rgb_to_luma(red_val, green_val, blue_val, true);
 
   importance = dbrow[col] ? atoi(dbrow[col]) : 0;
   col++;
@@ -736,6 +741,10 @@ void Monitor::Load(MYSQL_ROW dbrow, bool load_zones=true, Purpose p = QUERY) {
   audio_threshold = dbrow[col] ? atoi(dbrow[col]) : 0;
   col++;
   audio_alarm_score = dbrow[col] ? atoi(dbrow[col]) : 0;
+  col++;
+  device_class = dbrow[col] ? dbrow[col] : "Camera";
+  col++;
+  Go2RTC_disable_backchannel = dbrow[col] && atoi(dbrow[col]);
   col++;
 
   // How many frames we need to have before we start analysing.
@@ -827,28 +836,14 @@ void Monitor::LoadCamera() {
                record_audio
                                                 );
     } else if (protocol == "rtsp") {
-      Warning("Monitor %u (%s): the Remote/RTSP capture method is deprecated as of 1.40 and "
-              "will be removed in 1.41. Change this monitor to Type 'Ffmpeg' with Source Path %s",
-              id, name.c_str(),
-              remove_authentication(RtspUrlFromRemote(host, port, path, user, pass)).c_str());
-      camera = zm::make_unique<RemoteCameraRtsp>(this,
-               method,
-               host, // Host
-               port, // Port
-               path, // Path
-               user,
-               pass,
-               camera_width,
-               camera_height,
-               rtsp_describe,
-               colours,
-               brightness,
-               contrast,
-               hue,
-               colour,
-               purpose == CAPTURE,
-               record_audio
-                                                );
+      // The hand-written rtsp client this used is gone. ffmpeg speaks rtsp
+      // better than it did and is what every other rtsp monitor already uses,
+      // so there is nothing left for a second implementation to do. Name the
+      // exact Source Path to switch to rather than only saying no.
+      Error("Monitor %u (%s): the Remote/RTSP capture method has been removed. "
+            "Change this monitor to Type 'Ffmpeg' with Source Path %s",
+            id, name.c_str(),
+            remove_authentication(RtspUrlFromRemote(host, port, path, user, pass)).c_str());
     } else {
       Error("Unexpected remote camera protocol '%s'", protocol.c_str());
     }
@@ -885,50 +880,8 @@ void Monitor::LoadCamera() {
                                            hue,
                                            colour,
                                            purpose == CAPTURE,
-                                           record_audio,
-                                           decoder_hwaccel_name,
-                                           decoder_hwaccel_device
-                                          );
-    break;
-  }
-  case NVSOCKET: {
-    camera = zm::make_unique<RemoteCameraNVSocket>(this,
-             host.c_str(),
-             port.c_str(),
-             path.c_str(),
-             camera_width,
-             camera_height,
-             colours,
-             brightness,
-             contrast,
-             hue,
-             colour,
-             purpose == CAPTURE,
-             record_audio
-                                                  );
-    break;
-  }
-  case LIBVLC: {
-#if HAVE_LIBVLC
-    camera = zm::make_unique<LibvlcCamera>(this,
-                                           path.c_str(),
-                                           user,
-                                           pass,
-                                           method,
-                                           options,
-                                           camera_width,
-                                           camera_height,
-                                           colours,
-                                           brightness,
-                                           contrast,
-                                           hue,
-                                           colour,
-                                           purpose == CAPTURE,
                                            record_audio
                                           );
-#else // HAVE_LIBVLC
-    Error("You must have vlc libraries installed to use vlc cameras for monitor %d", id);
-#endif // HAVE_LIBVLC
     break;
   }
   case VNC: {
@@ -976,10 +929,16 @@ std::shared_ptr<Monitor> Monitor::Load(unsigned int p_id, bool load_zones, Purpo
 }
 
 bool Monitor::connect() {
-  ReloadZones();
-  if (zones.size() != zone_count) {
-    Warning("Monitor %d has incorrect zone_count %d != %zu", id, zone_count, zones.size());
-    zone_count = zones.size();
+  size_t n_zones;
+  if (zones_loaded) {
+    ReloadZones();
+    n_zones = zones.size();
+  } else {
+    n_zones = Zone::Count(shared_from_this());
+  }
+  if (n_zones != zone_count) {
+    Warning("Monitor %d has incorrect zone_count %d != %zu", id, zone_count, n_zones);
+    zone_count = n_zones;
   }
   if (mem_ptr != nullptr) {
     Warning("Already connected. Please call disconnect first.");
@@ -1192,6 +1151,7 @@ bool Monitor::connect() {
     shared_data->capturing = capturing;
     shared_data->recording = recording;
     shared_data->signal = false;
+    assume_signal_on_next_packet = true;
     shared_data->capture_fps = 0.0;
     shared_data->analysis_fps = 0.0;
     shared_data->latitude = latitude;
@@ -1271,9 +1231,8 @@ bool Monitor::connect() {
       //Janus_Manager->add_to_janus();
     }
 
-    if (use_Amcrest_API) {
-      Amcrest_Manager = new AmcrestAPI(this);
-    }
+    delete Amcrest_Manager;
+    Amcrest_Manager = use_Amcrest_API ? new AmcrestAPI(this) : nullptr;
 
     if (onvif_event_listener) {
       // Clean up existing ONVIF object to prevent memory leak and duplicate threads
@@ -1416,19 +1375,23 @@ Monitor::~Monitor() {
     delete Amcrest_Manager;
   }
   if (onvif) delete onvif;
+
+  // Release the shared encoder device contexts now that no VideoStore can be
+  // borrowing them (refs #5300).
+  for (auto &entry : encoder_hw_device_ctxs) {
+    if (entry.second) av_buffer_unref(&entry.second);
+  }
+  encoder_hw_device_ctxs.clear();
 }  // end Monitor::~Monitor()
 
 void Monitor::AddPrivacyBitmask() {
-  if (privacy_bitmask) {
-    delete[] privacy_bitmask;
-    privacy_bitmask = nullptr;
-  }
-  Image *privacy_image = nullptr;
+  privacy_bitmask = nullptr;
+  privacy_image.reset();
 
   for (const Zone &zone : zones) {
     if (zone.IsPrivacy()) {
       if (!privacy_image) {
-        privacy_image = new Image(width, height, 1, ZM_SUBPIX_ORDER_NONE);
+        privacy_image = zm::make_unique<Image>(width, height, 1, ZM_SUBPIX_ORDER_NONE);
         privacy_image->Clear();
       }
       privacy_image->Fill(0xff, zone.GetPolygon());
@@ -1579,7 +1542,8 @@ std::shared_ptr<ZMPacket> Monitor::getSnapshot(int index) {
   // ReadShmFrame syncs image_buffer[index] to the per-slot format that
   // zmc wrote, so the ZMPacket consumer can read its bytes in the
   // correct format instead of the placeholder set at attach time.
-  Image *src = ReadShmFrame(index);
+  // The packet deletes its image, so it needs its own copy of the ring slot.
+  Image *src = new Image(*ReadShmFrame(index));
   return std::make_shared<ZMPacket>(src,
       SystemTimePoint(zm::chrono::duration_cast<Microseconds>(shared_timestamps[index])));
 }
@@ -1847,6 +1811,10 @@ void Monitor::DumpZoneImage(const char *zone_string) {
     Debug(3, "Trying to load from local zmc");
     int index = shared_data->last_write_index;
     std::shared_ptr<ZMPacket>packet = getSnapshot(index);
+    if (!packet) {
+      Error("Unable to load an image for monitor %d", id);
+      return;
+    }
     zone_image = new Image(*packet->image);
   } else {
     Debug(3, "Trying to load from event");
@@ -1934,6 +1902,11 @@ bool Monitor::CheckSignal(const Image *image) {
   int linesize = image->LineSize();
   AVPixelFormat pix_fmt = image->PixFormat();
 
+  // 1 byte per pixel: the picture matches when every point holds the luma of
+  // the colour (either range), or its low byte, which is what this compared
+  // before and what GRAY8 setups were told to store (#000023).
+  bool luma_match = true, luma_full_match = true, low_byte_match = true;
+
   int index = 0;
   for (int i = 0; i < signal_check_points; i++) {
     while (true) {
@@ -1960,7 +1933,11 @@ bool Monitor::CheckSignal(const Image *image) {
     if (zm_bytes_per_pixel(pix_fmt) == 1) {
       // GRAY8 plus all planar YUV variants we transport (420P/J420P/422P/J422P).
       // For planar formats the Y plane is the first byte at each pixel index.
-      if (*(buffer + y * linesize + x) != grayscale_val)
+      const uint8_t value = *(buffer + y * linesize + x);
+      if (value != luma_val) luma_match = false;
+      if (value != luma_full_val) luma_full_match = false;
+      if (value != grayscale_val) low_byte_match = false;
+      if (!luma_match && !luma_full_match && !low_byte_match)
         return true;
 
     } else if (zm_is_rgb24(pix_fmt)) {
@@ -1991,21 +1968,39 @@ bool Monitor::CheckSignal(const Image *image) {
   return false;
 } // end bool Monitor::CheckSignal(const Image *image)
 
+bool Monitor::DecoderChecksSignal(DecodingOption decoding, int signal_check_points, bool has_viewers) {
+  if (signal_check_points <= 0) return false;
+  switch (decoding) {
+    case DECODING_ALWAYS:
+    case DECODING_KEYFRAMES:
+    case DECODING_KEYFRAMESONDEMAND:
+      return true;
+    case DECODING_ONDEMAND:
+      return has_viewers;
+    default:
+      return false;
+  }
+}
+
 void Monitor::CheckAction() {
 
   if (shared_data->action) {
     // Can there be more than 1 bit set in the action?  Shouldn't these be elseifs?
     if (shared_data->action & RELOAD) {
-      Info("Received reload indication at count %d", shared_data->image_count);
+      Info("Received reload indication at count %d", shared_data->image_count.load());
       shared_data->action &= ~RELOAD;
-      Reload();
+      // Not Reload() here: this runs on zmc's capture thread while the
+      // decoder and analysis threads read the settings Load() rewrites. Ask
+      // for the reload SIGHUP does instead; zmc runs it after Close() has
+      // stopped those threads. refs #5239
+      zm_reload = true;
     }
     if (shared_data->action & SUSPEND) {
       if (Active()) {
-        Info("Received suspend indication at count %d", shared_data->image_count);
+        Info("Received suspend indication at count %d", shared_data->image_count.load());
         shared_data->analysing = ANALYSING_NONE;
       } else {
-        Info("Received suspend indication at count %d, but wasn't active", shared_data->image_count);
+        Info("Received suspend indication at count %d, but wasn't active", shared_data->image_count.load());
       }
       if (config.max_suspend_time) {
         SystemTimePoint now = std::chrono::system_clock::now();
@@ -2014,7 +2009,7 @@ void Monitor::CheckAction() {
       shared_data->action &= ~SUSPEND;
     } else if (shared_data->action & RESUME) {
       if ( Enabled() && !Active() ) {
-        Info("Received resume indication at count %d", shared_data->image_count);
+        Info("Received resume indication at count %d", shared_data->image_count.load());
         shared_data->analysing = analysing;
         // Analysis thread owns ref_image; ask it to drop the pre-suspend
         // reference rather than freeing the buffer under it here (refs #4983).
@@ -2028,7 +2023,7 @@ void Monitor::CheckAction() {
   if (auto_resume_time.time_since_epoch() != Seconds(0)) {
     SystemTimePoint now = std::chrono::system_clock::now();
     if (now >= auto_resume_time) {
-      Info("Auto resuming at count %d", shared_data->image_count);
+      Info("Auto resuming at count %d", shared_data->image_count.load());
       auto_resume_time = {};
       shared_data->analysing = analysing;
       // See RESUME above: defer the reference-image reset to the analysis thread.
@@ -2052,9 +2047,9 @@ void Monitor::UpdateFPS() {
     double new_analysis_fps = (motion_frame_count - last_motion_frame_count) / elapsed.count();
 
     Debug(4, "FPS: capture count %d - last capture count %d = %d now:%lf, last %lf, elapsed %lf = capture: %lf fps analysis: %lf fps",
-        shared_data->image_count,
+        shared_data->image_count.load(),
         last_capture_image_count,
-        shared_data->image_count - last_capture_image_count,
+        shared_data->image_count.load() - last_capture_image_count,
         FPSeconds(now.time_since_epoch()).count(),
         FPSeconds(last_fps_time.time_since_epoch()).count(),
         elapsed.count(),
@@ -2069,7 +2064,7 @@ void Monitor::UpdateFPS() {
         )
        ) {
       Info("%s: %d - Capturing at %.2lf fps, capturing bandwidth %ubytes/sec Analysing at %.2lf fps",
-          name.c_str(), shared_data->image_count, new_capture_fps, new_capture_bandwidth, new_analysis_fps);
+          name.c_str(), shared_data->image_count.load(), new_capture_fps, new_capture_bandwidth, new_analysis_fps);
 
 #if MOSQUITTOPP_FOUND
       if (mqtt) mqtt->send(stringtf("Capturing at %.2lf fps, capturing bandwidth %ubytes/sec Analysing at %.2lf fps",
@@ -2099,10 +2094,8 @@ void Monitor::UpdateFPS() {
 
 //Thread where ONVIF polling, and other similar status polling can happen.
 //Since these can be blocking, run here to avoid intefering with other processing.
-//Loop runs every 10 seconds.
+//PollThread::Run() calls this every 10 seconds.
 bool Monitor::Poll() {
-  std::chrono::system_clock::time_point loop_start_time = std::chrono::system_clock::now();
-
   if (use_Amcrest_API) {
     if (Amcrest_Manager->isHealthy()) {
       Amcrest_Manager->WaitForMessage();
@@ -2131,7 +2124,6 @@ bool Monitor::Poll() {
       Janus_Manager->add_to_janus();
     }
   }
-  std::this_thread::sleep_until(loop_start_time + std::chrono::seconds(10));
   return true;
 } //end Poll
 
@@ -2173,13 +2165,23 @@ bool Monitor::Analyse() {
   last_signal = signal;
 
   Debug(3, "Motion detection is enabled?(%d) signal(%d) signal_change(%d) trigger state(%s) image index %d",
-        shared_data->analysing, signal, signal_change, TriggerState_Strings[trigger_data->trigger_state].c_str(), packet->image_index);
+        shared_data->analysing.load(), signal, signal_change, TriggerState_Strings[trigger_data->trigger_state].c_str(), packet->image_index);
 
   {
     // scope for event lock
     // Need to guard around event creation/deletion from Reload()
     std::lock_guard<std::mutex> lck(event_mutex);
     int score = 0;
+#ifdef WITH_GSOAP
+    // Whether the ONVIF alarm was sampled for this packet. The latch is only
+    // released once the packet is committed (packet->score set), not here,
+    // because Analyse() can return early at the decode gate and retry the same
+    // packet (refs #5301).
+    bool onvif_alarmed = false;
+#endif
+    // A link wake (see CheckOndemand) counted on this packet, cleared once the
+    // packet's score has been applied.
+    bool linked_wake = false;
     // Track this separately as alarm_frame_count messes with the logic
     int motion_score = -1;
 
@@ -2199,9 +2201,14 @@ bool Monitor::Analyse() {
         onvif->setNotes(noteSet);
         noteSetMap[MOTION_CAUSE] = noteSet;
         cause += "ONVIF";
-        // If the camera isn't going to send an event close, we need to close it here, but only after it has actually triggered an alarm.
-        //if (!Event_Poller_Closes_Event && state == ALARM)
-        //onvif->setAlarmed(false);
+        // Remember that we sampled the alarm, but do not release the latch here.
+        // For a video packet that is not yet decoded, Analyse() returns below at
+        // the decode gate before this packet's score is committed, and the same
+        // packet is retried. Releasing here would spend a momentary DetectedSound
+        // pulse on a frame that is never recorded, so the decoded retry sees no
+        // alarm and the event gets no alarm frame (refs #5301). Release only once
+        // the packet is actually scored, below.
+        onvif_alarmed = true;
       }  // end ONVIF_Trigger
 #endif
 
@@ -2221,7 +2228,7 @@ bool Monitor::Analyse() {
       if (audio_detection and shared_data->audio_alarm) {
         score += audio_alarm_score;
         Debug(4, "Triggered on AUDIO level %d >= %d, score += %d",
-              shared_data->audio_level, audio_threshold, audio_alarm_score);
+              shared_data->audio_level.load(), audio_threshold, audio_alarm_score);
         Event::StringSet noteSet;
         // A constant, like the ONVIF and Amcrest notes above. Event::updateNotes
         // only ever inserts into the set and rewrites the Notes column on each
@@ -2323,13 +2330,21 @@ bool Monitor::Analyse() {
           MonitorLinkExpression::Result result = linked_monitors->result();
           Debug(1, "Linked_monitor score %d", result.score);
 
-          if (result.score > 0) {
+          int link_score = result.score;
+          // Woken from an on-demand pause by a link whose alarm may have ended
+          // while the camera reopened: count it as alarmed until acted on.
+          linked_wake = LinkedWakePending();
+          if (linked_wake and link_score <= 0) {
+            Debug(1, "Counting the linked alarm that woke this monitor");
+            link_score = 1;
+          }
+          if (link_score > 0) {
             if (cause.length())
               cause += ", ";
             cause += LINKED_CAUSE;
             //Event::StringSet noteSet;
             //noteSet.insert(linked_monitors[i]->Name());
-            score += result.score;
+            score += link_score;
           }
         } else {
           Debug(4, "Not linked_monitors");
@@ -2348,7 +2363,7 @@ bool Monitor::Analyse() {
 
           // Ready means that we have captured the warmup # of frames
           if ((shared_data->analysing > ANALYSING_NONE) && Ready()) {
-            Debug(3, "signal and capturing and doing motion detection %d", shared_data->analysing);
+            Debug(3, "signal and capturing and doing motion detection %d", shared_data->analysing.load());
 
             if (analysis_fps_limit) {
               double capture_fps = get_capture_fps();
@@ -2470,7 +2485,7 @@ bool Monitor::Analyse() {
               Debug(1, "no image so skipping motion detection");
             }  // end if has image
           } else {
-            Debug(1, "Not analysing %d", shared_data->analysing);
+            Debug(1, "Not analysing %d", shared_data->analysing.load());
           } // end if active and doing motion detection
 
         } // end if videostream
@@ -2478,6 +2493,7 @@ bool Monitor::Analyse() {
         if (score > 255) score = 255;
         // Set this before any state changes so that it's value is picked up immediately by linked monitors
         shared_data->last_frame_score = score;
+        if (linked_wake) linked_wake_until_ = 0;
 
         if (score) {
           if ((state == IDLE) || (state == PREALARM)) {
@@ -2670,7 +2686,7 @@ bool Monitor::Analyse() {
                       event->Id(), event->AlarmFrames(), alarm_frame_count);
               }
             } else {
-              Warning("Recording mode unknown %d", shared_data->recording);
+              Warning("Recording mode unknown %d", shared_data->recording.load());
             }
           }  // end if event->Duration > min_section_length
         }  // end if event
@@ -2697,6 +2713,15 @@ bool Monitor::Analyse() {
       } // end if signal
 
       packet->score = score;
+#ifdef WITH_GSOAP
+      // Release the latch only once a video packet is committed with its score,
+      // because alarm_frames counts video frames. Releasing at the isAlarmed()
+      // check above would spend a momentary pulse on a packet that Analyse()
+      // discards and retries at the decode gate, or on an audio packet that is
+      // never counted as an alarm frame, leaving the event with none (refs #5301).
+      if (onvif and onvif_alarmed and packet->codec_type == AVMEDIA_TYPE_VIDEO)
+        onvif->observeAlarm();
+#endif
     } else {
       Debug(3, "trigger == off");
       if (event) {
@@ -2711,6 +2736,7 @@ bool Monitor::Analyse() {
       if (packetqueue.should_try_clear(packet->keyframe)) {
         packetqueue.clearPackets(packet);
       }
+      packetqueue.releaseDecoded();
       // Only do these if it's a video packet.
       shared_data->last_read_index = packet->image_index;
       analysis_image_count++;
@@ -2742,6 +2768,15 @@ bool Monitor::Analyse() {
       // Free up the decoded frame as well, we won't be using it for anything at this time.
       //packet->out_frame = nullptr;
     }
+
+    // The decoded frame has been written to shm and analysed (y_image points
+    // into it). From here on everything reads packet->image, so the frame is
+    // only still needed by an encoder that has no image to work from. Keeping
+    // it holds a decoder pool buffer for every queued packet (refs #4860).
+    if (packet->in_frame and (packet->image or videowriter == PASSTHROUGH
+                              or shared_data->recording == RECORDING_NONE)) {
+      packet->release_frames();
+    }
   }  // end scope for event_lock
   packet->analyzed = true;
   packet->notify_all();  // Wake up event thread waiting for analyzed
@@ -2761,7 +2796,7 @@ void Monitor::Reload() {
   {
     std::lock_guard<std::mutex> lck(event_mutex);
     if (event) {
-      Info("%s: %03d - Closing event %" PRIu64 ", reloading", name.c_str(), shared_data->image_count, event->Id());
+      Info("%s: %03d - Closing event %" PRIu64 ", reloading", name.c_str(), shared_data->image_count.load(), event->Id());
       closeEvent();
     }
   }
@@ -2840,6 +2875,41 @@ void Monitor::ReloadLinkedMonitors() {
   }
 }  // end if p_linked_monitors
 }  // end void Monitor::ReloadLinkedMonitors()
+
+Monitor::OndemandStep Monitor::DecideOndemand(bool viewed, bool has_image, bool primed, bool busy,
+                                              const std::function<bool()> &link_alarmed) {
+  if (viewed or !has_image) return primed ? OndemandStep::CAPTURE : OndemandStep::PLAY;
+  // Nobody is watching. Finish an alarm and its post-event frames first, as
+  // the event they belong to is still being recorded.
+  if (primed) return busy ? OndemandStep::CAPTURE : OndemandStep::PAUSE;
+  return link_alarmed() ? OndemandStep::PLAY : OndemandStep::SLEEP;
+}
+
+Monitor::OndemandStep Monitor::CheckOndemand() {
+  const SystemTimePoint now = std::chrono::system_clock::now();
+  const int64 last_viewed = getLastViewed();
+  const int64 since_last_view =
+    static_cast<int64>(std::chrono::duration_cast<Seconds>(now.time_since_epoch()).count()) - last_viewed;
+  Debug(1, "Last view %" PRId64 " = %" PRId64 " seconds since last view", last_viewed, since_last_view);
+
+  const bool viewed = last_viewed and (since_last_view <= 10);
+  const bool busy = (GetState() != IDLE) or LinkedWakePending();
+  return DecideOndemand(viewed, GetLastWriteIndex() != -1, camera->isPrimed(), busy, [this]() {
+    // Paused, so the analysis thread that evaluates the links is stopped and
+    // reading them here does not race it.
+    if (!linked_monitors or linked_monitors->result().score <= 0) return false;
+    Info("%s: woken by a linked monitor's alarm", name.c_str());
+    linked_wake_until_ = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                           (std::chrono::steady_clock::now() + kLinkedWakeTimeout).time_since_epoch()).count();
+    return true;
+  });
+}
+
+bool Monitor::LinkedWakePending() const {
+  const int64_t until = linked_wake_until_;
+  return until and (std::chrono::duration_cast<std::chrono::nanoseconds>(
+                      std::chrono::steady_clock::now().time_since_epoch()).count() < until);
+}
 
 std::string Monitor::RtspUrlFromRemote(
     const std::string &host, const std::string &port,
@@ -2925,6 +2995,13 @@ void Monitor::LoadActions() {
     else if (trigger == "Alarm") action.trigger = EventAction::ALARM;
     else if (trigger == "AlarmEnd") action.trigger = EventAction::ALARM_END;
     else if (trigger == "Manual") action.trigger = EventAction::MANUAL;
+    else if (trigger == "Schedule") {
+      // Run by cron, which calls zmcontrol.pl the same way the web ui does
+      // for a manual action. Recognised here only so that having one does not
+      // warn on every reload; it is never fired from this process.
+      Debug(1, "Monitor %u: skipping scheduled action, cron owns it", id);
+      continue;
+    }
     else {
       Warning("Monitor %u: ignoring action with unknown trigger '%s'", id, trigger.c_str());
       continue;
@@ -3048,7 +3125,7 @@ std::vector<std::shared_ptr<Monitor>> Monitor::LoadLocalMonitors
   std::string where = "`Capturing` != 'None' AND `Type` = 'Local'";
 
   if (device[0])
-    where += " AND `Device`='" + std::string(device) + "'";
+    where += " AND `Device`='" + zmDbEscapeString(device) + "'";
   if (staticConfig.SERVER_ID)
     where += stringtf(" AND `ServerId`=%d", staticConfig.SERVER_ID);
   return LoadMonitors(where, purpose);
@@ -3061,14 +3138,16 @@ std::vector<std::shared_ptr<Monitor>> Monitor::LoadRemoteMonitors
   if (staticConfig.SERVER_ID)
     where += stringtf(" AND `ServerId`=%d", staticConfig.SERVER_ID);
   if (protocol)
-    where += stringtf(" AND `Protocol` = '%s' AND `Host` = '%s' AND `Port` = '%s' AND `Path` = '%s'", protocol, host, port, path);
+    where += stringtf(" AND `Protocol` = '%s' AND `Host` = '%s' AND `Port` = '%s' AND `Path` = '%s'",
+                      zmDbEscapeString(protocol).c_str(), zmDbEscapeString(host).c_str(),
+                      zmDbEscapeString(port).c_str(), zmDbEscapeString(path).c_str());
   return LoadMonitors(where, purpose);
 }
 
 std::vector<std::shared_ptr<Monitor>> Monitor::LoadFileMonitors(const char *file, Purpose purpose) {
   std::string where = "`Capturing` != 'None' AND `Type` = 'File'";
   if (file[0])
-    where += " AND `Path`='" + std::string(file) + "'";
+    where += " AND `Path`='" + zmDbEscapeString(file) + "'";
   if (staticConfig.SERVER_ID)
     where += stringtf(" AND `ServerId`=%d", staticConfig.SERVER_ID);
   return LoadMonitors(where, purpose);
@@ -3077,7 +3156,7 @@ std::vector<std::shared_ptr<Monitor>> Monitor::LoadFileMonitors(const char *file
 std::vector<std::shared_ptr<Monitor>> Monitor::LoadFfmpegMonitors(const char *file, Purpose purpose) {
   std::string where = "`Capturing` != 'None' AND `Type` = 'Ffmpeg'";
   if (file[0])
-    where += " AND `Path` = '" + std::string(file) + "'";
+    where += " AND `Path` = '" + zmDbEscapeString(file) + "'";
   if (staticConfig.SERVER_ID)
     where += stringtf(" AND `ServerId`=%d", staticConfig.SERVER_ID);
   return LoadMonitors(where, purpose);
@@ -3096,6 +3175,47 @@ bool Monitor::AudioLevelWanted(SystemTimePoint now) const {
       static_cast<uint32_t>(std::chrono::system_clock::to_time_t(now)));
 }
 
+// Keeps a camera's timestamps going forward across a jump back in its clock (an
+// NTP sync or a clock reset), the way ffmpeg's demuxer does with its timestamp
+// offset: when a stream's dts steps back by more than kDtsStepBack, the offset
+// shared by all the camera's streams moves so that the stream carries on one
+// frame after where it was, and every packet gets the offset from then on. The
+// queue, the event's choice of first keyframe and the video store then see one
+// continuous timeline, with nothing to split or patch (refs #4242). Smaller
+// steps are reordering jitter, left to the video store's reorder queue; steps of
+// 10 s or more never get here, FfmpegCamera drops them.
+int64_t Monitor::KeepDtsContinuous(AVPacket *packet, AVRational time_base) {
+  if (packet->dts == AV_NOPTS_VALUE) return dts_offset_;
+
+  int64_t dts = av_rescale_q(packet->dts, time_base, AV_TIME_BASE_Q) + dts_offset_;
+  auto last = last_dts_.find(packet->stream_index);
+  if (last != last_dts_.end()) {
+    int64_t step = dts - last->second;
+    if (step < -kDtsStepBack) {
+      // One frame on from the last packet: this packet's duration, else the
+      // stream's last step.
+      int64_t frame = (packet->duration > 0) ? av_rescale_q(packet->duration, time_base, AV_TIME_BASE_Q)
+                                             : last_dts_step_[packet->stream_index];
+      if (frame <= 0) frame = 1;
+      int64_t shift = last->second + frame - dts;
+      dts_offset_ += shift;
+      dts += shift;
+      Info("%s: stream %d timestamps jumped back %.3f seconds, continuing them from where they were",
+           name.c_str(), packet->stream_index, -step / 1000000.0);
+    } else if (step > 0) {
+      last_dts_step_[packet->stream_index] = step;
+    }
+  }
+  last_dts_[packet->stream_index] = dts;
+
+  if (dts_offset_) {
+    int64_t shift = av_rescale_q(dts_offset_, AV_TIME_BASE_Q, time_base);
+    packet->dts += shift;
+    if (packet->pts != AV_NOPTS_VALUE) packet->pts += shift;
+  }
+  return dts_offset_;
+}
+
 int Monitor::Capture() {
   if (!shared_data->capturing) {
     Debug(1, "Not capturing");
@@ -3112,20 +3232,26 @@ int Monitor::Capture() {
   packet->timestamp = std::chrono::system_clock::now();
   shared_data->heartbeat_time = std::chrono::system_clock::to_time_t(packet->timestamp);
   int captureResult = camera->Capture(packet);
-  Debug(4, "Back from capture result=%d image count %d timestamp %" PRId64, captureResult, shared_data->image_count,
+  Debug(4, "Back from capture result=%d image count %d timestamp %" PRId64, captureResult, shared_data->image_count.load(),
       static_cast<int64>(std::chrono::duration_cast<Microseconds>(packet->timestamp.time_since_epoch()).count())
       );
 
   if (captureResult < 0) {
-    // Unable to capture image
+    // Unable to capture image. zmc closes the monitor and reconnects, and
+    // connect() clears the image ring.
+    shared_data->signal = false;
+    // With a decoder thread running, it is the ring's only writer: it picks
+    // its slot from last_write_index, this thread from image_count, so both
+    // could write the same slot or move last_write_index backwards. Viewers
+    // keep its last frame until the reconnect. refs #5237
+    if (decoding != DECODING_NONE) return -1;
+
     // Fake a signal loss image
-    // Not sure what to do here.  We will close monitor and kill analysis_thread but what about rtsp server?
     Rgb signalcolor;
     /* HTML colour code is actually BGR in memory, we want RGB */
     signalcolor = rgb_convert(signal_check_colour, ZM_SUBPIX_ORDER_BGR);
     Image *capture_image = new Image(width, height, camera->Colours(), camera->SubpixelOrder());
     capture_image->Fill(signalcolor);
-    shared_data->signal = false;
     // Publish in dependency order: slot bytes, then per-slot timestamp,
     // then last_write_time (fresh from packet->timestamp, not the stale
     // tv_sec the slot held from its previous occupant), then
@@ -3138,12 +3264,23 @@ int Monitor::Capture() {
     shared_data->last_write_index = index;
     delete capture_image;
     shared_data->image_count++;
-    // What about timestamping it?
     // Don't want to do analysis on it, but we won't due to signal
     return -1;
   } else if (captureResult > 0) {
-    shared_data->signal = true;   // Assume if getting packets that we are getting something useful. CheckSignalPoints can correct this later.
-    // If we captured, let's assume signal, Decode will detect further
+    // Before anything else sees the packet: a jump back in the camera's clock is
+    // taken out of the timestamps here, so the queue, the event and the video
+    // store all see one continuous timeline (refs #4242).
+    if (packet->stream) {
+      int64_t offset = KeepDtsContinuous(packet->packet.get(), packet->stream->time_base);
+      if (offset and (packet->packet->pts != AV_NOPTS_VALUE)) packet->pts += offset;
+    }
+    // Getting packets: assume signal unless the decoder measures it
+    // (SignalCheckPoints). Writing true here as well made a lost-signal
+    // picture flip back to "signal" between decoded frames.
+    if (assume_signal_on_next_packet or !DecoderChecksSignal(decoding, signal_check_points, hasViewers())) {
+      shared_data->signal = true;
+      assume_signal_on_next_packet = false;
+    }
     if (decoding == DECODING_NONE) {
       shared_data->last_write_index = index;
       shared_data->last_write_time = std::chrono::system_clock::to_time_t(packet->timestamp);
@@ -3151,10 +3288,17 @@ int Monitor::Capture() {
       packet->notify_all();
     }
     Debug(2, "Have packet stream_index:%d ?= videostream_id: %d q.vpktcount %d event? %d image_count %d",
-          packet->packet->stream_index, video_stream_id, packetqueue.packet_count(video_stream_id), ( event ? 1 : 0 ), shared_data->image_count);
+          packet->packet->stream_index, video_stream_id, packetqueue.packet_count(video_stream_id), ( event ? 1 : 0 ), shared_data->image_count.load());
 
     if (packet->codec_type == AVMEDIA_TYPE_VIDEO) {
       packet->packet->stream_index = video_stream_id; // Convert to packetQueue's index
+      // The reading is only as fresh as the last audio packet; with the audio gone it would keep scoring frames.
+      if ((shared_data->audio_alarm or shared_data->audio_level) and
+          (packet->timestamp - last_audio_packet_time > Seconds(AUDIO_STALE_SECONDS))) {
+        Debug(2, "No audio packet for %d seconds, clearing the audio level", AUDIO_STALE_SECONDS);
+        shared_data->audio_level = 0;
+        shared_data->audio_alarm = 0;
+      }
       if (stream_socket)
         stream_socket->SendMedia(packet->packet.get(), zm::stream_socket::StreamId::Video,
                                  packet->keyframe, packet->pts);
@@ -3182,6 +3326,7 @@ int Monitor::Capture() {
         if (audio_detector.IsOpen()) {
           const int level = audio_detector.Process(packet->packet.get());
           const bool alarm = audio_detection and AudioDetector::IsAlarm(level, audio_threshold);
+          last_audio_packet_time = packet->timestamp;
           shared_data->audio_level = static_cast<uint8_t>(level);
           shared_data->audio_alarm = alarm ? 1 : 0;
           if (alarm)
@@ -3400,8 +3545,8 @@ bool Monitor::applyDeinterlacing(std::shared_ptr<ZMPacket> &packet, Image *captu
 }
 
 void Monitor::flushDecoderQueue() {
-  // Called from DecoderThread::Run() as the decoder thread exits, so no
-  // concurrent access to decoder_queue: the thread that mutates it is us.
+  // Called on the decoder thread (as it exits, and from Decode() when the
+  // queue is full), so no concurrent access to decoder_queue.
   decoder_requires_next_packet = false;
   if (decoder_queue.empty()) return;
   Debug(1, "Flushing %zu in-flight entries from decoder_queue", decoder_queue.size());
@@ -3415,8 +3560,72 @@ void Monitor::flushDecoderQueue() {
   packetqueue.notify_all();  // wake the analysis thread if it's waiting
 }
 
+// The codec can consume packets without ever returning a frame for them: after
+// lost or corrupt slices (RTP over UDP) H.264 drops pictures until it has one it
+// can reference again. Pairing each frame with the oldest entry would leave those
+// entries in decoder_queue for good, pair every later frame with an older packet,
+// and once the queue passes the throttle in Decode() stop decoding altogether.
+// Returns the entry whose packet has frame_pts, after releasing the entries before
+// it with an earlier pts (decoded, no image). end() when the frame is older than
+// every entry; begin() when there is no pts to go by or no entry has it.
+std::list<ZMPacketLock>::iterator Monitor::MatchDecodedFrame(int64_t frame_pts) {
+  if (frame_pts == AV_NOPTS_VALUE) return decoder_queue.begin();
+
+  auto match = std::find_if(decoder_queue.begin(), decoder_queue.end(),
+      [frame_pts](const ZMPacketLock &lock) {
+        return lock.packet_ && lock.packet_->packet->pts == frame_pts;
+      });
+  if (match == decoder_queue.end()) {
+    bool older_than_all = std::all_of(decoder_queue.begin(), decoder_queue.end(),
+        [frame_pts](const ZMPacketLock &lock) {
+          return lock.packet_ && lock.packet_->packet->pts != AV_NOPTS_VALUE &&
+                 lock.packet_->packet->pts > frame_pts;
+        });
+    return older_than_all ? decoder_queue.end() : decoder_queue.begin();
+  }
+
+  size_t released = 0;
+  for (auto it = decoder_queue.begin(); it != match;) {
+    if (it->packet_->packet->pts != AV_NOPTS_VALUE && it->packet_->packet->pts < frame_pts) {
+      it->packet_->decoded = true;
+      it->packet_->notify_all();
+      it = decoder_queue.erase(it);
+      released++;
+    } else {
+      ++it;  // reordered (B-frame) reference still to come out
+    }
+  }
+  if (released) {
+    Debug(1, "Codec returned no frame for %zu packets before pts %" PRId64 ", released them, decoder queue size=%zu",
+          released, frame_pts, decoder_queue.size());
+    packetqueue.notify_all();
+  }
+  return match;
+}
+
+// 2 x the keyframe interval, plus the frames the codec holds back before it
+// returns one: reordering (B-frames) and one per extra frame thread. Without the
+// delay, an all-intra stream (keyframe interval 1) decoded with frame threads
+// would pass the limit with nothing wrong and be flushed every few frames.
+size_t Monitor::DecoderQueueLimit(int max_keyframe_interval, const AVCodecContext *context) {
+  size_t delay = 0;
+  if (context) {
+    if (context->has_b_frames > 0) delay += context->has_b_frames;
+    if ((context->active_thread_type & FF_THREAD_FRAME) && (context->thread_count > 1))
+      delay += context->thread_count - 1;
+  }
+  return 2 * static_cast<size_t>(max_keyframe_interval) + delay;
+}
+
+bool Monitor::SkipUntilKeyframe(bool keyframe) {
+  if (!decoder_needs_keyframe) return false;
+  if (!keyframe) return true;
+  decoder_needs_keyframe = false;
+  return false;
+}
+
 bool Monitor::Decode() {
-  AVCodecContext *context = camera->getVideoCodecContext();
+  AVCodecContext *context = GetVideoCodecContext();
   ZMPacketLock packet_lock;
   std::shared_ptr<ZMPacket> packet;
 
@@ -3456,10 +3665,17 @@ bool Monitor::Decode() {
 
       int ret = front_packet->receive_frame(context);
       if (ret > 0) {
-        // Success - got a decoded frame, take ownership and process it
-        packet_lock = std::move(decoder_queue.front());
-        decoder_queue.pop_front();
-        packet = front_packet;
+        // Success - got a decoded frame; hand it to the packet it came from
+        av_frame_ptr frame = std::move(front_packet->in_frame);
+        auto match = MatchDecodedFrame(frame->pts);
+        if (match == decoder_queue.end()) {
+          Debug(1, "Dropping decoded frame pts %" PRId64 ", older than every packet in the decoder queue", frame->pts);
+          return true;
+        }
+        packet_lock = std::move(*match);
+        decoder_queue.erase(match);
+        packet = packet_lock.packet_;
+        packet->in_frame = std::move(frame);
         Debug(2, "Received frame for packet %d, decoder queue pop size=%zu", packet->image_index, decoder_queue.size());
         // Continue to PHASE 3 (frame processing)
       } else if (ret < 0) {
@@ -3482,9 +3698,14 @@ bool Monitor::Decode() {
     // Throttle: don't queue too many packets in the decoder
     int max_keyframe = packetqueue.get_max_keyframe_interval();
     if ((max_keyframe > 0) &&
-        (decoder_queue.size() > 2 * static_cast<size_t>(max_keyframe))) {
-      Debug(1, "Decoder queue full (%zu packets), throttling", decoder_queue.size());
-      return false;
+        (decoder_queue.size() > DecoderQueueLimit(max_keyframe, context))) {
+      // Only reached when receiving above came back EAGAIN: the codec waits for
+      // input, so holding it back would stop decoding for good. Start over from
+      // the next keyframe.
+      Warning("Decoder queue full (%zu packets) and the codec wants more input, flushing it", decoder_queue.size());
+      avcodec_flush_buffers(context);
+      flushDecoderQueue();
+      decoder_needs_keyframe = true;
     }
 
     // Get next packet from the main packet queue
@@ -3513,6 +3734,10 @@ bool Monitor::Decode() {
       ((decoding == DECODING_KEYFRAMES) && (packet->keyframe || decoder_requires_next_packet)) ||
       ((decoding == DECODING_KEYFRAMESONDEMAND) && (hasViewers() || packet->keyframe || decoder_requires_next_packet))
     );
+    if (should_decode && SkipUntilKeyframe(packet->keyframe)) {
+      Debug(2, "Not sending packet %d to the decoder, waiting for a keyframe after the flush", packet->image_index);
+      should_decode = false;
+    }
 
     if (!should_decode && !decoder_queue.empty()) {
       // Viewer stopped (or decoding no longer needed) while packets were
@@ -4121,7 +4346,7 @@ unsigned int Monitor::DetectMotion(const Image &comp_image, Event::StringSet &zo
       shared_data->alarm_y = alarm_centre.y_;
 
       Info("Got alarm centre at %d,%d, at count %d",
-           shared_data->alarm_x, shared_data->alarm_y, analysis_image_count);
+           shared_data->alarm_x.load(), shared_data->alarm_y.load(), analysis_image_count);
     } else {
       shared_data->alarm_x = shared_data->alarm_y = -1;
     }
@@ -4362,26 +4587,112 @@ void Monitor::SendStreamHealthEvent(uint16_t code, const std::string &message, i
   RefreshStreamSnapshot();
 }
 
+int Monitor::OpenDecoder() {
+  // Always a fresh decoder, which is also how hardware decoding gets retried.
+  // A transient failure -- a GPU still resetting, a driver that finished
+  // initialising after zmc started, a render node not yet permissioned --
+  // would otherwise pin the monitor to software for the life of the process,
+  // long after the hardware is healthy. Reconnects call PrimeCapture(), so
+  // they are the natural retry point.
+  CloseDecoder();
+
+  if (!camera) return 0;
+
+  AVStream *stream = camera->getVideoStream();
+  if (!stream) {
+    // Cameras that hand over images rather than packets -- LocalCamera, vlc,
+    // vnc -- have nothing to decode.
+    Debug(1, "No video stream to decode");
+    return 0;
+  }
+
+  mVideoCodecContext = open_video_decoder(
+      stream,
+      decoder_name,
+      decoder_hwaccel_name,
+      decoder_hwaccel_device,
+      options,
+      name,
+      decoder_hw_pix_fmt,
+      decoder_hw_device_ctx);
+
+  if (!mVideoCodecContext) {
+    Error("Failed to open a decoder for monitor %s", name.c_str());
+    return -1;
+  }
+  return 1;
+}  // end int Monitor::OpenDecoder()
+
+void Monitor::CloseDecoder() {
+  // Order matters: the context holds a reference to the device, and its opaque
+  // points at decoder_hw_pix_fmt. Free the context first so nothing can read
+  // either afterwards.
+  if (mVideoCodecContext) {
+    avcodec_free_context(&mVideoCodecContext);
+    mVideoCodecContext = nullptr;
+  }
+  if (decoder_hw_device_ctx) {
+    av_buffer_unref(&decoder_hw_device_ctx);
+    decoder_hw_device_ctx = nullptr;
+  }
+  decoder_hw_pix_fmt = AV_PIX_FMT_NONE;
+}  // end void Monitor::CloseDecoder()
+
+#if HAVE_LIBAVUTIL_HWCONTEXT_H && LIBAVCODEC_VERSION_CHECK(57, 107, 0, 107, 0)
+AVBufferRef *Monitor::GetEncoderHWDeviceContext(AVHWDeviceType type, const std::string &device) {
+  if (type == AV_HWDEVICE_TYPE_NONE) return nullptr;
+
+  std::lock_guard<std::mutex> lck(encoder_hw_device_ctx_mutex);
+
+  // One cached context per (type, device). A failed probe of another encoder
+  // type never drops the one a previous probe created, so the device survives
+  // for the monitor's life and is not reopened per event (refs #5300).
+  auto key = std::make_pair(static_cast<int>(type), device);
+  auto it = encoder_hw_device_ctxs.find(key);
+  if (it == encoder_hw_device_ctxs.end()) {
+    AVBufferRef *ctx = nullptr;
+    int ret = av_hwdevice_ctx_create(&ctx, type,
+        device.empty() ? nullptr : device.c_str(), nullptr, 0);
+    if (ret < 0) {
+      Error("Failed to create encoder hwdevice_ctx %s", av_make_error_string(ret).c_str());
+      return nullptr;
+    }
+    Debug(1, "Created shared encoder hwdevice_ctx type %d device %s",
+        static_cast<int>(type), device.c_str());
+    it = encoder_hw_device_ctxs.emplace(key, ctx).first;
+  }
+
+  // Hand out a reference the caller owns; the cached context stays with us.
+  return av_buffer_ref(it->second);
+}  // end AVBufferRef *Monitor::GetEncoderHWDeviceContext()
+#endif
+
 int Monitor::PrimeCapture() {
-  // Stop the decoder before tearing the codec context down. The decoder
-  // thread holds a raw AVCodecContext* it got from
-  // camera->getVideoCodecContext(); camera->PrimeCapture() will Close() the
-  // camera (freeing that context) and OpenFfmpeg() a new one. Running the
-  // decoder against the dying context is unsafe; equally important, on
-  // exit the decoder thread releases the in-flight packet locks in
-  // decoder_queue (see DecoderThread::Run). Without that, stale entries
-  // survive the reconnect and create a permanent latency offset against
-  // the new codec context — the analysis thread blocks on
-  // !packet->decoded for those packets and the packetqueue fills to
-  // max_video_packet_count and stays there.
+  // Stop the decoder before tearing the codec context down. The decoder thread
+  // holds a raw AVCodecContext* that CloseDecoder() below frees, and running it
+  // against a dying context is unsafe. Equally important, on exit the decoder
+  // thread releases the in-flight packet locks in decoder_queue (see
+  // DecoderThread::Run). Without that, stale entries survive the reconnect and
+  // create a permanent latency offset against the new codec context — the
+  // analysis thread blocks on !packet->decoded for those packets and the
+  // packetqueue fills to max_video_packet_count and stays there.
   if (decoder) {
     decoder->Stop();
     packetqueue.notify_all();  // wake the thread if it's blocked on wait_for
     decoder->Join();
   }
+  // Safe now that the only thread holding this pointer has been joined.
+  CloseDecoder();
+
+  // The new stream may carry a different audio codec, which the old decoder would reject.
+  audio_detector.Close();
+  audio_detector.TakePeak();
 
   int ret = camera->PrimeCapture();
   if (ret <= 0) return ret;
+
+  // After the camera, which is what produces the stream to decode from.
+  if (OpenDecoder() < 0) return -1;
 
   if ( -1 != camera->getVideoStreamId() ) {
     video_stream_id = packetqueue.addStream();
@@ -4500,7 +4811,6 @@ int Monitor::Pause() {
       sws_freeContext(convert_context);
       convert_context = nullptr;
     }
-    decoding_image_count = 0;
     // Do not reset last_write_index: the last captured image stays in shm so
     // that mode=single/thumbnails can still be served while paused.
   }
@@ -4508,6 +4818,8 @@ int Monitor::Pause() {
     Debug(1, "Joining analysis");
     analysis_thread->Join();
   }
+  // After both joins: Ready() on the analysis thread reads it.
+  if (decoder) decoding_image_count = 0;
 
   // Must close event before closing camera because it uses in_streams
   {
@@ -4521,7 +4833,7 @@ int Monitor::Pause() {
   {
     std::lock_guard<std::mutex> lck(event_mutex);
     if (event) {
-      Info("%s: image_count:%d - Closing event %" PRIu64 ", shutting down", name.c_str(), shared_data->image_count, event->Id());
+      Info("%s: image_count:%d - Closing event %" PRIu64 ", shutting down", name.c_str(), shared_data->image_count.load(), event->Id());
       closeEvent();
       {
         std::lock_guard<std::mutex> close_lck(close_event_thread_mutex);
@@ -4529,17 +4841,31 @@ int Monitor::Pause() {
       }
     }
   }
+  // The decoder thread was joined at the top of Pause(), so nothing is using
+  // the context any more. Release it with the camera rather than carrying a
+  // decoder for a stream that is gone.
+  CloseDecoder();
+
   if (camera) {
     camera->Close();
   }
 
   packetqueue.clear();
+  // The next capture session's timestamps start over.
+  dts_offset_ = 0;
+  last_dts_.clear();
+  last_dts_step_.clear();
   return 1;
 } // end int Monitor::Pause()
 
 int Monitor::Play() {
   int ret = camera->PrimeCapture();
   if (ret <= 0) return ret;
+
+  // Pause() released the decoder, so resuming has to open another. This is the
+  // on-demand path: an unwatched monitor is paused and played again when
+  // somebody looks at it, without ever going back through PrimeCapture().
+  if (OpenDecoder() < 0) return -1;
 
   if ( -1 != camera->getVideoStreamId() ) {
     video_stream_id = packetqueue.addStream();
@@ -4629,7 +4955,7 @@ void Monitor::get_ref_image() {
     and !zm_terminate) {
 
     Debug(1, "Waiting for capture daemon lastwriteindex(%d) lastwritetime(%" PRIi64 ")",
-          shared_data->last_write_index, static_cast<int64>(shared_data->last_write_time));
+          shared_data->last_write_index.load(), static_cast<int64>(shared_data->last_write_time));
     if (packet_lock.packet_ and ! packet_lock.packet_->image) {
       packet_lock.unlock();
       // can't analyse it anyways, incremement

@@ -110,15 +110,16 @@ if ($action == 'save') {
       'DecodingEnabled' => 0,
       'RTSP2WebEnabled' => 0,
       'Go2RTCEnabled' => 0,
+      'Go2RTCDisableBackChannel' => 0,
       'JanusEnabled' => 0,
       'JanusAudioEnabled' => 0,
       'Restream' => 0,
 //       'Janus_RTSP_Session_Timeout' => 0,
       'Exif' => 0,
-      'RTSPDescribe' => 0,
       'V4LMultiBuffer'  => '',
       'WallClockTimestamps' => '',
       'RecordAudio' => 0,
+      'AudioDetection' => 0,
       'Method' => 'raw',
       'GroupIds'  =>  array(),
       'LinkedMonitors'  => array(),
@@ -153,8 +154,15 @@ if ($action == 'save') {
   if (!empty($newMonitor['ModelId']) and empty($newMonitor['Model']))
     unset($newMonitor['Model']);
 
+  $refused = $monitor->commandFieldChangesNotAllowed($newMonitor);
+  if (count($refused)) {
+    $error_message .= 'Changing '.implode(', ', $refused).' requires System edit permission.<br/>';
+    ZM\Warning('Refused to save monitor '.$mid.': '.implode(', ', $refused).' requires System edit permission');
+    return;
+  }
+
   $changes = $monitor->changes($newMonitor);
-  ZM\Debug('Changes: '. print_r($changes, true));
+  ZM\Debug('Changes: '. print_r(ZM\redactForLog($changes), true));
   $restart = false;
 
   if (count($changes)) {
@@ -288,25 +296,17 @@ if ($action == 'save') {
 
       if ( $monitor->insert($changes) ) {
         $mid = $monitor->Id();
-        // Zone coords are now stored as percentages (0-100)
-        $zoneWidth = $newMonitor['Width'];
-        $zoneHeight = $newMonitor['Height'];
-        if (isset($newMonitor['Orientation']) &&
-            ($newMonitor['Orientation'] == 'ROTATE_90' || $newMonitor['Orientation'] == 'ROTATE_270')) {
-          $zoneWidth = $newMonitor['Height'];
-          $zoneHeight = $newMonitor['Width'];
-        }
-        $zoneArea = $zoneWidth * $zoneHeight;
+        // Zone coords and thresholds are stored as percentages (0-100)
         $zone = new ZM\Zone();
         if (!$zone->save(['MonitorId'=>$monitor->Id(), 'Name'=>'All',
           'Units'=>'Percent',
           'Coords'=>'0.00,0.00 100.00,0.00 100.00,100.00 0.00,100.00',
           'Area'=>10000,
-          'MinAlarmPixels'=>intval(($zoneArea*.05)/100),
-          'MaxAlarmPixels'=>intval(($zoneArea*75)/100),
-          'MinFilterPixels'=>intval(($zoneArea*.05)/100),
-          'MaxFilterPixels'=>intval(($zoneArea*75)/100),
-          'MinBlobPixels'=>intval(($zoneArea*.05)/100)
+          'MinAlarmPixels'=>0.05,
+          'MaxAlarmPixels'=>75,
+          'MinFilterPixels'=>0.05,
+          'MaxFilterPixels'=>75,
+          'MinBlobPixels'=>0.05
         ])) {
           $error_message .= $zone->get_last_error();
           ZM\Error('Error adding zone:' . $error_message);
@@ -372,6 +372,7 @@ if ($action == 'save') {
 
   if ( isset($_REQUEST['newAction']) and is_array($_REQUEST['newAction']) ) {
     require_once('includes/MonitorAction.php');
+    require_once('includes/CronTab.php');
 
     $submitted_ids = array();
     foreach ( $_REQUEST['newAction'] as $posted ) {
@@ -392,6 +393,42 @@ if ($action == 'save') {
       $action_type = isset($posted['ActionType']) ? $posted['ActionType'] : '';
       $trigger_on = isset($posted['TriggerOn']) ? $posted['TriggerOn'] : 'EventStart';
 
+      # The editor collects "Every <when> at <time>"; cron's five fields are
+      # what gets stored and written to the crontab. A schedule it could not
+      # draw comes back untouched in ScheduleRaw so editing a row does not
+      # destroy one that was set another way.
+      #
+      # Built and validated here rather than trusted from the browser: this
+      # string ends up in a crontab line, so the one check that matters has to
+      # be on this side of the request.
+      $schedule = '';
+      if ( $trigger_on == 'Schedule' ) {
+        if ( isset($posted['ScheduleRaw']) and (trim($posted['ScheduleRaw']) !== '') ) {
+          $schedule = trim($posted['ScheduleRaw']);
+        } else {
+          $frequency = isset($posted['ScheduleFrequency']) ? $posted['ScheduleFrequency'] : '';
+          $time = isset($posted['ScheduleTime']) ? trim($posted['ScheduleTime']) : '';
+          # <input type="time"> gives HH:MM, and HH:MM:SS where seconds are on.
+          if ( !preg_match('/^(\d{1,2}):(\d{2})(?::\d{2})?$/', $time, $hm) ) {
+            $error_message .= 'Ignoring action: "'.validHtmlStr($time).
+              '" is not a time of day.<br/>';
+            continue;
+          }
+          $schedule = cronFromParts($frequency, intval($hm[1]), intval($hm[2]));
+          if ($schedule === null) {
+            $error_message .= 'Ignoring action: could not make a schedule from "'.
+              validHtmlStr($frequency).'" at "'.validHtmlStr($time).'".<br/>';
+            continue;
+          }
+        }
+
+        if ( !cronScheduleIsValid($schedule) ) {
+          $error_message .= 'Ignoring action: "'.validHtmlStr($schedule).
+            '" is not a schedule this can run.<br/>';
+          continue;
+        }
+      }
+
       $target_monitor = ZM\Monitor::find_one(array('Id'=>$target));
       $allowed = ZM\MonitorAction::typesForMonitor($target_monitor);
       if ( !in_array($action_type, $allowed) ) {
@@ -403,6 +440,7 @@ if ($action == 'save') {
         'MonitorId'       => $mid,
         'TargetMonitorId' => $target,
         'TriggerOn'       => $trigger_on,
+        'Schedule'        => $schedule,
         'ActionType'      => $action_type,
         'AudioFile'       => (!isset($posted['AudioFile']) or $posted['AudioFile'] === '')
                                ? null : validInt($posted['AudioFile']),
@@ -414,8 +452,11 @@ if ($action == 'save') {
       if ( !$action ) $action = new ZM\MonitorAction();
 
       if ( $action->Id() ) {
-        $action->save($values);
-        $submitted_ids[] = $action->Id();
+        if ( $action->save($values) ) {
+          $submitted_ids[] = $action->Id();
+        } else {
+          $error_message .= 'Error saving monitor action: '.$action->get_last_error().'<br/>';
+        }
       } else if ( $action->insert($values) ) {
         $submitted_ids[] = $action->Id();
       } else {
@@ -425,6 +466,13 @@ if ($action == 'save') {
 
     # zmc re-reads the action list on restart, so a change here needs one.
     $restart = true;
+
+    # cron owns the scheduled ones, so the crontab is rebuilt from the table
+    # on every save. Doing it here rather than on a timer means the crontab
+    # cannot drift from what the operator just agreed to.
+    if ( cronRebuildScheduledActions() === false )
+      $error_message .= 'Saved, but the crontab could not be updated, so '.
+        'scheduled actions will not run. See the log for why.<br/>';
   } # end if newAction
 
   if ( $restart ) {

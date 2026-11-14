@@ -168,6 +168,15 @@ if (isset($_REQUEST['filter'])) {
     // branch this replaces was marked "this should be redundant" when written.
   } # end if REQUEST[Filter]
 }
+// The range comes from the request, stored cookies or the filter's date terms, and
+// is written into the page script, so keep only what parses as a time and use its
+// canonical form. refs GHSA-qm44-862r-fmq3
+foreach (array('minTime', 'maxTime') as $rangeVar) {
+  if (isset($$rangeVar) and ($$rangeVar !== null) and ($$rangeVar !== '')) {
+    $rangeSecs = strtotime($$rangeVar);
+    $$rangeVar = ($rangeSecs === false) ? null : date('Y-m-d H:i:s', $rangeSecs);
+  }
+}
 if (!$liveMode) {
   # Stored selections are a convenience for the default, filter-less page: a
   # filter given in the request is authoritative and must not be widened or
@@ -405,7 +414,7 @@ if (count($filter->terms())) {
           <button type="button" id="panright"  data-on-click="click_panright"   ><?php echo translate('Pan') ?> &gt;</button>
 <?php
   if ($liveMode) {
-    if (defined('ZM_FEATURES_SNAPSHOTS') and ZM_FEATURES_SNAPSHOTS) { ?>
+    if (defined('ZM_FEATURES_SNAPSHOTS') and ZM_FEATURES_SNAPSHOTS and canEdit('Snapshots')) { ?>
           <button type="button" name="snapshotBtn" data-on-click-this="takeSnapshot">
             <i class="material-icons md-18">camera_enhance</i>
             &nbsp;<?php echo translate('Snapshot') ?>
@@ -435,7 +444,7 @@ if (count($filter->terms())) {
 <?php
   // Monitor images - these had to be loaded after the monitors used were determined (after loading events)
   foreach ( $monitors as $m ) {
-    echo '<canvas title="'.$m->Id().' '.validHtmlStr($m->Name()).'" width="'.($m->Width() * $defaultScale).'" height="'.($m->Height() * $defaultScale).'" id="Monitor'.$m->Id().'" style="border:1px solid '.$m->WebColour().'" monitor_id="'.$m->Id().'">No Canvas Support!!</canvas>
+    echo '<canvas title="'.$m->Id().' '.validHtmlStr($m->Name()).'" width="'.($m->Width() * $defaultScale).'" height="'.($m->Height() * $defaultScale).'" id="Monitor'.$m->Id().'" style="border:1px solid '.validHtmlStr($m->WebColour()).'" monitor_id="'.$m->Id().'">No Canvas Support!!</canvas>
 ';
   }
 ?>

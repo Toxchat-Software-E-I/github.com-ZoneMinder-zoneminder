@@ -260,8 +260,6 @@ set(ZM_MYSQL_ENGINE "InnoDB" CACHE STRING
 set(ZM_NO_MMAP "OFF" CACHE BOOL
   "Set to ON to not use mmap shared memory. Shouldn't be enabled unless you
     experience problems with the shared memory. default: OFF")
-set(ZM_NO_LIBVLC "OFF" CACHE BOOL
-  "Set to ON to skip libvlc checks and force building ZM without libvlc. default: OFF")
 set(ZM_NO_LIBVNC "OFF" CACHE BOOL
   "Set to ON to skip libvnc checks and force building ZM without libvnc. default: OFF")
 set(ZM_NO_CURL "OFF" CACHE BOOL
@@ -573,12 +571,18 @@ if(NOT ZM_NO_MQTT)
   endif (MOSQUITTOPP_FOUND)
 endif()
 
-# mysqlclient (using find_library and find_path)
-  find_library(MYSQLCLIENT_LIBRARIES mysqlclient PATH_SUFFIXES mysql)
+# MySQL client library (using find_library and find_path). Either name works:
+# libmysqlclient (MySQL, or MariaDB Connector/C through its compatibility
+# package, headers under include/mysql) or libmariadb (MariaDB Connector/C on
+# its own, as Gentoo's dev-db/mariadb-connector-c and Fedora's
+# mariadb-connector-c-devel install it: libmariadb.so and include/mariadb/mysql.h,
+# no libmysqlclient names). mysqlclient is tried first in every directory, so a
+# system with both keeps the library it built against before.
+  find_library(MYSQLCLIENT_LIBRARIES NAMES mysqlclient mariadb PATH_SUFFIXES mysql mariadb)
 if(MYSQLCLIENT_LIBRARIES)
   set(HAVE_LIBMYSQLCLIENT 1)
   list(APPEND ZM_BIN_LIBS "${MYSQLCLIENT_LIBRARIES}")
-  find_path(MYSQLCLIENT_INCLUDE_DIR mysql.h PATH_SUFFIXES mysql)
+  find_path(MYSQLCLIENT_INCLUDE_DIR mysql.h PATH_SUFFIXES mysql mariadb)
   if(MYSQLCLIENT_INCLUDE_DIR)
     list(APPEND ZM_INCLUDE_DIRS "${MYSQLCLIENT_INCLUDE_DIR}")
     set(CMAKE_REQUIRED_INCLUDES "${MYSQLCLIENT_INCLUDE_DIR}")
@@ -630,26 +634,6 @@ if(FFMPEG_EXECUTABLE)
   mark_as_advanced(FFMPEG_EXECUTABLE)
 endif()
 
-# Do not check for libvlc if ZM_NO_LIBVLC is on
-if(NOT ZM_NO_LIBVLC)
-  # libvlc (using find_library and find_path)
-  find_library(LIBVLC_LIBRARIES vlc)
-  if(LIBVLC_LIBRARIES)
-    set(HAVE_LIBVLC 1)
-    #list(APPEND ZM_BIN_LIBS "${LIBVLC_LIBRARIES}")
-    find_path(LIBVLC_INCLUDE_DIR "vlc/vlc.h")
-    if(LIBVLC_INCLUDE_DIR)
-      list(APPEND ZM_INCLUDE_DIRS "${LIBVLC_INCLUDE_DIR}")
-      set(CMAKE_REQUIRED_INCLUDES "${LIBVLC_INCLUDE_DIR}")
-    endif()
-    mark_as_advanced(FORCE LIBVLC_LIBRARIES LIBVLC_INCLUDE_DIR)
-    check_include_file("vlc/vlc.h" HAVE_VLC_VLC_H)
-    set(optlibsfound "${optlibsfound} libVLC")
-  else()
-    set(optlibsnotfound "${optlibsnotfound} libVLC")
-  endif()
-endif()
-
 if(NOT ZM_NO_LIBVNC)
   # libvncclient (using find_library and find_path)
   find_library(LIBVNC_LIBRARIES vncclient)
@@ -678,6 +662,13 @@ endif()
 
 
 find_package(GSOAP 2.8.91)
+# The gsoap plugins are built against OpenSSL whatever the crypto backend
+if (GSOAP_FOUND)
+  find_package(OpenSSL)
+  if (NOT OPENSSL_FOUND OR NOT GSOAP_SSL_CXX_LIBRARIES)
+    set(GSOAP_FOUND FALSE)
+  endif()
+endif()
 if (GSOAP_FOUND)
   set(optlibsfound "${optlibsfound} gsoap")
 else()

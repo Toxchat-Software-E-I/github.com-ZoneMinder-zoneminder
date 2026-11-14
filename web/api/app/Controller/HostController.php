@@ -9,9 +9,10 @@ class HostController extends AppController {
     # To try to prevent abuse here, we are only going to allow certain characters in the daemon and args.
     $count = 0;
     $safe_daemon = $daemon ? preg_replace('/[^A-Za-z0-9\- \.]/', '', $daemon, -1, $count) : false;
-    if ($count) Error("Invalid characters found in daemon string ($daemon). Potential attack?");
+    if ($count) ZM\Error("Invalid characters found in daemon string ($daemon). Potential attack?");
+    $count = 0;
     $safe_args = $args ? preg_replace('/[^A-Za-z0-9\- \.]/', '', $args, -1, $count) : false;
-    if ($count) Error("Invalid characters found in args string ($args). Potential attack?");
+    if ($count) ZM\Error("Invalid characters found in args string ($args). Potential attack?");
 
     $string = ZM_PATH_BIN.'/zmdc.pl check';
     if ($safe_daemon) {
@@ -38,16 +39,16 @@ class HostController extends AppController {
     } else {
       $permission = 'Edit';
     }
-    $allowed = (!$user) || ($user->System() == $permission );
+    $allowed = (!$user) || ($user->System() == 'Edit') || ($permission == 'View' && $user->System() == 'View');
     if ( !$allowed ) {
       throw new UnauthorizedException(__("Insufficient privileges"));
       return;
     }
     # To try to prevent abuse here, we are only going to allow certain characters in the daemon and args.
     $safe_daemon = preg_replace('/[^A-Za-z0-9\-\.]/', '', $daemon, -1, $count);
-    if ($count) Error("Invalid characters found in daemon string ($daemon). Potential attack?");
+    if ($count) ZM\Error("Invalid characters found in daemon string ($daemon). Potential attack?");
     $safe_command = preg_replace('/[^a-z]/', '', $command, -1, $count);
-    if ($count) Error("Invalid characters found in command string ($command). Potential attack?");
+    if ($count) ZM\Error("Invalid characters found in command string ($command). Potential attack?");
     $string = ZM_PATH_BIN."/zmdc.pl $safe_command $safe_daemon";
     $result = exec($string);
     $this->set(array(
@@ -95,6 +96,12 @@ class HostController extends AppController {
 
     if ( !($username && $password) && !$token ) {
       throw new UnauthorizedException(__('No identity provided'));
+    }
+    if ( $username && $password && $token ) {
+      // beforeFilter() authenticates the token after the password and keeps the token's
+      // user, so the refresh token minted below would be issued to whoever the token
+      // belongs to. A login takes one or the other.
+      throw new UnauthorizedException(__('Log in with a user name and password or with a token, not both'));
     }
 
     $cred = [];
@@ -160,7 +167,8 @@ class HostController extends AppController {
       if ( ZM_AUTH_RELAY == 'hashed' ) {
         $credentials = 'auth='.generateAuthHash(ZM_AUTH_HASH_IPS, true);
       } else {
-        $credentials = 'user='.$_SESSION['Username'].'&pass=';
+        global $user;
+        $credentials = 'user='.urlencode($user->Username()).'&pass=';
         $appendPassword = 1;
       }
     }
@@ -284,7 +292,7 @@ class HostController extends AppController {
         $name = $value['Monitor']['Name'];
         $color = $value['Monitor']['WebColour'];
 
-        $space = shell_exec("du -s0 $zm_dir_events/$id | awk '{print $1}'");
+        $space = shell_exec("du -s0 ".escapeshellarg($zm_dir_events.'/'.$id)." | awk '{print $1}'");
         if ( $space == null ) {
           $space = 0;
         }
@@ -297,7 +305,7 @@ class HostController extends AppController {
       }
 
       // Add total usage to array
-      $space = shell_exec( "df $zm_dir_events |tail -n1 | awk '{print $3 }'");
+      $space = shell_exec( "df ".escapeshellarg($zm_dir_events)." |tail -n1 | awk '{print $3 }'");
       $space = $space/1024/1024;
       $usage['Total'] = array(
         'space' => rtrim($space),

@@ -22,6 +22,11 @@ if ( empty($_REQUEST['eid']) ) {
   $message = 'No event id supplied';
 } else {
   $eid = validInt($_REQUEST['eid']);
+  # canView('Events') above is global; a user with Events=View can still be
+  # denied individual monitors. Require the per-event permission before listing
+  # its frame records, as ajax/event.php and the Frames API already do.
+  if ( !$message and !(new ZM\Event($eid))->canView() )
+    $message = 'Insufficient permissions to view frames for event '.$eid;
 }
 
 if ( $message ) {
@@ -176,7 +181,7 @@ function queryRequest($eid, $search, $advsearch, $sort, $offset, $order, $limit)
       # Build the subcomponents needed for the image source
       $ratio_factor = $Monitor->ViewHeight() / $Monitor->ViewWidth();
       $thmb_width = ZM_WEB_LIST_THUMB_WIDTH ? 'width='.ZM_WEB_LIST_THUMB_WIDTH : '';
-      $thmb_height = 'height="'.( ZM_WEB_LIST_THUMB_HEIGHT ? ZM_WEB_LIST_THUMB_HEIGHT : ZM_WEB_LIST_THUMB_WIDTH*$ratio_factor ) .'"';
+      $thmb_height = 'height='.(int)round(ZM_WEB_LIST_THUMB_HEIGHT ? ZM_WEB_LIST_THUMB_HEIGHT : ZM_WEB_LIST_THUMB_WIDTH*$ratio_factor);
       $thmb_fn = 'filename=' .$Event->MonitorId(). '_' .$row['EventId']. '_' .$row['FrameId']. '.jpg';
 
       # Assemble the scaled and unscaled image source image source components
@@ -184,7 +189,7 @@ function queryRequest($eid, $search, $advsearch, $sort, $offset, $order, $limit)
       $full_img_src = join('&amp;', array_filter(array($base_img_src, $thmb_fn)));
       
       # finally, we assemble the the entire thumbnail img src structure, whew
-      $row['Thumbnail'] = '<img src="' .$img_src. '" '.$thmb_width. ' ' .$thmb_height. 'img_src="' .$img_src. '" full_img_src="' .$full_img_src. '">';
+      $row['Thumbnail'] = '<img src="' .$img_src. '" '.$thmb_width. ' ' .$thmb_height. ' img_src="' .$img_src. '" full_img_src="' .$full_img_src. '">';
     }
     $returned_rows[] = $row;
   } # end foreach row matching search

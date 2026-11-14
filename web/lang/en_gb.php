@@ -54,6 +54,9 @@
 
 // Simple String Replacements
 $SLANG = array(
+    'PrivateValueHidden'    => 'This value is private and is shown only to users who can edit System settings.',
+    'OptionSetInConfigFile' => 'Set by the system owner in %s.',
+    'OptionSetInConfigFileHidden' => 'Set by the system owner in %s. The value is not shown.',
     'SystemLog'             => 'System Log',
     'DateTime'              => 'Date/Time',
     'DiskSpace'             => 'Disk Space',
@@ -115,6 +118,8 @@ $SLANG = array(
     'AttrArchiveStatus'     => 'Archive Status',
     'AttrAvgScore'          => 'Avg. Score',
     'AttrCause'             => 'Cause',
+    'AttrDate'              => 'Date',
+    'AttrDateTime'          => 'Date/Time',
     'AttrStartDate'         => 'Start Date',
     'AttrEndDate'           => 'End Date',
     'AttrStartDateTime'     => 'Start Date/Time',
@@ -157,6 +162,7 @@ $SLANG = array(
     'BadChannel'            => 'Channel must be set to an integer of zero or more',
     'BadDevice'             => 'Device must be set to a valid value',
     'BadEncoderParameters'  => 'Encoder does not work well without at least a value for crf. Please see the help.',
+    'BadFfmpegOptions'      => 'Source -> Options must be key=value pairs separated by commas or new lines, such as tls_verify=0. Write ffmpeg command line flags like -tls_verify 0 without the dash and with =. Could not use:',
     'BadFormat'             => 'Format must be set to a valid value',
     'BadFPSReportInterval'  => 'FPS report interval buffer count must be an integer of 0 or more',
     'BadMotionFrameSkip'    => 'Motion Frame skip count must be an integer of zero or more',
@@ -240,6 +246,38 @@ $SLANG = array(
     'ActionTriggerAlarm'      => 'Alarm begins',
     'ActionTriggerAlarmEnd'     => 'Alarm ends',
     'ActionTriggerManual'     => 'Manually triggered',
+    'ActionTriggerSchedule'     => 'At a time',
+    'ActionSchedule'            => 'Schedule',
+    'ActionScheduleAdvanced'    => 'This schedule was set outside the editor and is shown as it stands. Clear the row and add it again to use the pickers.',
+    'CommandNotAllowed'         => 'That command is not permitted. ZM_ALLOWED_COMMANDS limits this to:',
+    'ScheduledTasks'            => 'Scheduled Tasks',
+    'ScheduledTasksHelp'        => 'Commands run on a schedule by cron, from the web user\'s own crontab. ZoneMinder rewrites only its own block there and leaves any other entries alone. These run as the web user, so adding one is the same level of trust as a filter that runs a command.',
+    'CronCommand'               => 'Command',
+    'CronCommandHelp'           => 'Run as the web user. A literal percent sign must be written \\%, because cron treats an unescaped one as the end of the command.',
+    'CronWhen'                  => 'When',
+    'CronAddTask'               => 'Add a scheduled task',
+    'CronEditTask'              => 'Edit scheduled task',
+    'CronAdvanced'              => 'Enter as cron',
+    'CronAdvancedHelp'          => 'Set by the pickers, or type five cron fields directly for anything they cannot express.',
+    'CronAnyServer'             => 'Every server',
+    'CronScheduleAsCron'        => '(as the cron field below)',
+    'CronNoTasks'               => 'No scheduled tasks yet.',
+    'CronBadSchedule'           => 'That is not a schedule this can run. Five cron fields are expected, for example "0 3 * * *".',
+    'CronBadCommand'            => 'That is not a command this can run. It must not be empty, must stay on one line, and any percent sign must be written \\%.',
+    'CronWriteFailed'           => 'Saved, but the crontab could not be written, so this will not run. See the log for why.',
+    'CronConfirmDelete'         => 'Delete the selected scheduled tasks?',
+    'ScheduleEvery'             => 'Every',
+    'ScheduleAt'                => 'at',
+    'ScheduleEveryDay'          => 'day',
+    'ScheduleEveryWeekday'      => 'weekday (Mon-Fri)',
+    'ScheduleEveryWeekend'      => 'weekend day (Sat & Sun)',
+    'ScheduleEveryMonday'       => 'Monday',
+    'ScheduleEveryTuesday'      => 'Tuesday',
+    'ScheduleEveryWednesday'    => 'Wednesday',
+    'ScheduleEveryThursday'     => 'Thursday',
+    'ScheduleEveryFriday'       => 'Friday',
+    'ScheduleEverySaturday'     => 'Saturday',
+    'ScheduleEverySunday'       => 'Sunday',
     'ActionLightOn'           => 'Turn light on',
     'ActionLightOff'          => 'Turn light off',
     'ActionIndicatorLightOn'  => 'Turn indicator on',
@@ -284,6 +322,10 @@ $SLANG = array(
     'ConfiguredFor'         => 'Configured for',
     'ConfigURL'             => 'Config Base URL',
     'ConfirmAction'         => 'Action Confirmation',
+    'ClearAllLogs'          => 'Clear ALL Logs',
+    'ClearFilteredLogs'     => 'Clear Filtered Logs',
+    'ConfirmClearAllLogs'   => 'No rows are selected, so this will delete all log entries. Are you sure?',
+    'ConfirmClearFilteredLogs' => 'No rows are selected, so this will delete every log entry matching the current filter. Are you sure?',
     'ConfirmClearLogs'      => 'Are you sure you wish to delete the selected log entries?',
     'ConfirmClearLogsTitle' => 'Clear Logs Confirmation',
     'ConfirmDeleteControl'  => 'Warning, deleting a control will reset all monitors that use it to be uncontrollable.<br><br>Are you sure you wish to delete?',
@@ -309,7 +351,7 @@ $SLANG = array(
     'ConfirmUnarchiveEvents'=> 'Are you sure you wish to unarchive the selected events?',
     'ConjAnd'               => 'and',
     'ConjOr'                => 'or',
-    'ContactAdmin'          => 'Please contact your adminstrator for details.',
+    'ContactAdmin'          => 'Please contact your administrator for details.',
     'ControlAddress'        => 'Control Address',
     'ControlCap'            => 'Control Capability',
     'ControlCaps'           => 'Control Capabilities',
@@ -321,8 +363,8 @@ $SLANG = array(
     'DefaultScale'          => 'Default Scale',
     'DefaultCodec'          => 'Default Method For Event View',
     'DefaultView'           => 'Default View',
+    'DefaultPasswordChange' => 'This account uses the password admin, which everyone knows. Enter it again and choose a new password to log in.',
     'RecordingSource'       => 'Recording Source',
-    'RTSPDescribe'          => 'Use RTSP Response Media URL',
     'DeleteAndNext'         => 'Delete &amp; Next',
     'DeleteAndPrev'         => 'Delete &amp; Prev',
     'DeleteSavedFilter'     => 'Delete saved filter',
@@ -413,6 +455,15 @@ $SLANG = array(
     'FilterUploadEvents'    => 'Upload all matches',
     'FilterUser'            => 'User to run filter as',
     'FilterVideoEvents'     => 'Create video for all matches',
+    'FirstRunAuthFixed'     => 'A setting in zm.conf or conf.d requires a login, so it can\'t be turned off here.',
+    'FirstRunAuthOff'       => 'Don\'t require a login',
+    'FirstRunAuthOffText'   => 'Anyone who can reach this server, including any web page opened in a browser on the same network, can view and control every camera and change every setting. You can turn logins on later in Options, System (OPT_USE_AUTH).',
+    'FirstRunAuthOn'        => 'Require a login (recommended)',
+    'FirstRunAuthOnText'    => 'Choose a password for the admin account. You can add users with their own permissions later in Options, Users.',
+    'FirstRunContinue'      => 'Continue without a login',
+    'FirstRunIntro'         => 'Choose whether ZoneMinder asks for a login. Until you do, the web interface, the API and camera streams can\'t be used.',
+    'FirstRunSetPassword'   => 'Set password and continue',
+    'FirstRunTitle'         => 'Set up ZoneMinder',
     'FlippedHori'           => 'Flipped Horizontally',
     'FlippedVert'           => 'Flipped Vertically',
     'ForceAlarm'            => 'Force Alarm',
@@ -425,6 +476,7 @@ $SLANG = array(
     'GeneratingVideo'       => 'Generating Video',
     'Generate QR Code'      => 'Generate QR Code',
     'GetCurrentLocation'    => 'Get Current Location',
+    'Go2RTCDisableBackchannel' => 'Disable Go2RTC audio backchannel',
     'GoToFrame'             => 'Go to Frame',
     'GoToZoneMinder'        => 'Go to ZoneMinder.com',
     'HasFocusSpeed'         => 'Has Focus Speed',
@@ -443,7 +495,9 @@ $SLANG = array(
     'ImagesPerClass'        => 'Images per class',
     'InsufficientPermissionsUser'=> 'Insufficient permissions for user',
     'MaxImageBufferCount'   => 'Maximum Image Buffer Size (frames)',
+    'IntelGpu'              => 'Intel GPU',
     'InvalidateTokens'      => 'Invalidate all generated tokens',
+    'IPAddress'             => 'IP Address',
     'KeyString'             => 'Key String',
     'LimitResultsPost'      => 'results only', // This is used at the end of the phrase 'Limit to first N results only'
     'LimitResultsPre'       => 'Limit to first', // This is used at the beginning of the phrase 'Limit to first N results only'
@@ -453,6 +507,7 @@ $SLANG = array(
     'LoggingIn'             => 'Logging In',
     'Lowband'               => 'Low&nbsp;B/W',
     'Mail'                  => 'Email',
+    'MapUnavailable'        => 'Map unavailable: the Leaflet library is not installed (js/leaflet in the web root).',
     'MaxBandwidth'          => 'Max Bandwidth',
     'MaxBrScore'            => 'Max.<br/>Score',
     'MaxFocusRange'         => 'Max Focus Range',
@@ -536,6 +591,8 @@ $SLANG = array(
     'NewLabel'              => 'New Label',
     'NewRole'               => 'New Role',
     'NewPassword'           => 'New Password',
+    'NewPasswordIsDefault'  => 'The new password must not be admin.',
+    'NewPasswordRequired'   => 'Enter a new password.',
     'NewState'              => 'New State',
     'NewUser'               => 'New User',
     'NextFrame'             => 'Next Frame',
@@ -607,6 +664,7 @@ $SLANG = array(
     'PanRight'              => 'Pan Right',
     'PanTilt'               => 'Pan/Tilt',
     'ParentGroup'           => 'Parent Group',
+    'PasswordTooShort'      => 'The new password must have at least %d characters.',
     'PasswordsDifferent'    => 'The new and confirm passwords are different',
     'Password'              => 'Password',
     'PathToIndex'           => 'Path To Index',
@@ -655,12 +713,14 @@ $SLANG = array(
     <li>Manufacturer</li>
     <li>Model</li>
     <li>Type</li>
-    <li>Function</li>
+    <li>Capturing, Analysing and Recording</li>
+    <li>Source path, with the user name, password and host removed</li>
     <li>Width</li>
     <li>Height</li>
     <li>Colours</li>
     <li>MaxFPS</li>
     <li>AlarmMaxFPS</li>
+    <li>Whether Janus, Go2RTC, RTSP2Web and the RTSP server are enabled</li>
    </ul>',
     'PrivacyConclusionText' => 'We are <u>NOT</u> collecting any image specific data from your cameras. We don’t know what your cameras are watching. This data will not be sold or used for any purpose not stated herein. By clicking accept, you agree to send us this data to help make ZoneMinder a better product. By clicking decline, you can still freely use ZoneMinder and all its features.',
     'Probe'                 => 'Probe',
@@ -698,7 +758,7 @@ $SLANG = array(
     'RemoteImageColours'    => 'Image Colours',
     'RemoteMethod'          => 'Method',
     'RemoteProtocol'        => 'Protocol',
-    'RemoteRtspDeprecated'      => 'ZoneMinder\'s own RTSP support is deprecated as of 1.40 and will be removed in 1.41. Change this monitor to Type Ffmpeg, putting the full rtsp:// URL in Source Path. The capture log names the exact URL to use.',
+    'RemoteRtspDeprecated'      => 'ZoneMinder\'s own RTSP support has been removed in favour of Ffmpeg. This monitor will not capture until you change it to Type Ffmpeg, putting the full rtsp:// URL in Source Path. The capture log names the exact URL to use.',
     'ReplayAll'             => 'All Events',
     'ReplayGapless'         => 'Gapless Events',
     'ReplaySingle'          => 'Single Event',
@@ -716,6 +776,7 @@ $SLANG = array(
     'Roles'                 => 'Roles',
     'RotateLeft'            => 'Rotate Left',
     'RotateRight'           => 'Rotate Right',
+    'RTSPServer'            => 'RTSP Server',
     'RTSPStreamName'        => 'RTSP Stream Name',
     'RTSPTransport'         => 'RTSP Transport Protocol',
     'RunAudit'              => 'Run Audit Process',
@@ -774,8 +835,10 @@ $SLANG = array(
     'StorageScheme'         => 'Scheme',
     'StreamReplayBuffer'    => 'Stream Replay Image Buffer',
     'TargetColorspace'      => 'Target colorspace',
-    'Deprecated'                => 'deprecated',
+    'Removed'                   => 'removed',
     'DeprecatedColoursSetting' => 'Deprecated - will be auto-detected in a future release',
+    'ThisSession'           => 'This Session',
+    'ThisSessionHint'       => 'These settings apply to this browser session only. They are kept in a cookie rather than saved on the server, so they do not affect other sessions or other users.',
     'TimeDelta'             => 'Time Delta',
     'TimelineTip1'          => 'Pass your mouse over the graph to view a snapshot image and event details.',              // Added 2013.08.15.
     'TimelineTip2'          => 'Click on the coloured sections of the graph, or the image, to view the event.',              // Added 2013.08.15.
@@ -896,7 +959,7 @@ $SLANG = array(
     'es_ar' => 'Spanish Argentina',
     'es_es' => 'Spanish Spain',
     'en_gb' => 'British English',
-    'en_us' => 'Us English',
+    'en_us' => 'US English',
     'fr_fr' => 'French',
     'cs_cz' => 'Czech',
     'zh_cn' => 'Simplified Chinese',
@@ -915,6 +978,9 @@ $SLANG = array(
     'dk_dk' => 'Danish',
     'ro_ro' => 'Romanian',
     'no_nb' => 'Norwegian',
+    'ba_ba' => 'Bosnian',
+    'big5_big5' => 'Traditional Chinese (Big5)',
+    'tr_tr' => 'Turkish',
   'option:router' => 'Gateway',
 );
 
@@ -1044,8 +1110,10 @@ if (!function_exists('zmVlang')) {
 $OLANG = array(
 	'OPTIONS_FFMPEG' => array(
     'Help' => '
-      Parameters in this field are passed on to FFmpeg. Multiple parameters can be separated by ,~~
+      Parameters in this field are passed on to FFmpeg as key=value pairs. Multiple parameters can be separated by , or put on separate lines.~~
+      An ffmpeg command line flag such as -tls_verify 0 is written tls_verify=0: no leading dash, and = between the name and the value.~~
       Examples (do not enter quotes)~~~~
+      "tls_verify=0" Accept the camera certificate without verifying it on rtsps:// sources~~~~
       "allowed_media_types=video" Set datatype to request from cam (audio, video, data)~~~~
       "reorder_queue_size=nnn" Set number of packets to buffer for handling of reordered packets
     '
@@ -1091,26 +1159,9 @@ $OLANG = array(
         HTTP - Use HTTP tunneling as transport protocol, which is useful for passing proxies.~~
       '
 	),
-	'OPTIONS_LIBVLC' => array(
-    'Help' => '
-      Parameters in this field are passed on to libVLC. Multiple parameters can be separated by ,~~
-      Examples (do not enter quotes)~~~~
-      "--rtp-client-port=nnn" Set local port to use for rtp data~~~~
-      "--verbose=2" Set verbosity of libVLC
-      '
-	),
 	'OPTIONS_EXIF' => array(
 		'Help' => 'Enable this option to embed EXIF data into each jpeg frame.'
 	),
-	'OPTIONS_RTSPDESCRIBE' => array(
-    'Help' => '
-      Sometimes, during the initial RTSP handshake, the camera will send an updated media URL.
-      Enable this option to tell ZoneMinder to use this URL. Disable this option to ignore the
-      value from the camera and use the value as entered in the monitor configuration~~~~
-      Generally this should be enabled. However, there are cases where the camera can get its
-      own URL incorrect, such as when the camera is streaming through a firewall
-    '
-  ),
 	'OPTIONS_MAXFPS' => array(
     'Help' => '
       This field has certain limitations when used for non-local devices.~~
@@ -1206,6 +1257,18 @@ None: No frames will be decoded, live view and thumbnails will not be available~
       RTSP2Web supports MSE (Media Source Extensions), HLS (HTTP Live Streaming), and WebRTC.
       Each has its advantages, with WebRTC probably being the most performant, but also the most picky about codecs.'
   ),
+  'FUNCTION_GO2RTC_DISABLE_BACKCHANNEL_FULL' => array(
+    'Help' => '
+      Enabled by default to prevent compatibility issues with some cameras, particularly Dahua models.~~
+      When live viewing through go2rtc is active, these issues may cause ONVIF events (such as motion or sound detection) to stop working and prevent ZoneMinder from recording events.~~~~
+      Disable this option if your camera requires RTSP backchannel functionality, or if you need two-way audio (talkback) through go2rtc.~~
+      If your camera works correctly with ONVIF events and recording while live viewing is active, you can also disable this option to retain the default backchannel behavior.'
+  ),
+  'FUNCTION_GO2RTC_DISABLE_BACKCHANNEL_SHORT' => array(
+    'Help' => '
+      Disable RTSP backchannel to prevent ONVIF event and recording issues with some cameras (particularly Dahua). 
+      Disable this option if two-way audio is required or your camera works correctly with backchannel enabled.'
+  ),
   'FUNCTION_JANUS_ENABLED' => array(
     'Help' => '
       Attempt to use Janus streaming server for h264/h265 live view. Experimental, but allows
@@ -1284,6 +1347,32 @@ None: No frames will be decoded, live view and thumbnails will not be available~
   'ZM_TRAINING_DETECT_SCRIPT' => array(
     'Prompt' => 'Object detection script location',
     'Help' => 'Full path to the object detection script (e.g. /var/lib/zmeventnotification/bin/zm_detect.py).~~When set, a Detect button appears in the annotation editor that runs detection on the current frame.~~The script is called as: script -f image -m monitor_id~~Leave empty to disable automatic detection.'
+  ),
+  'OPTIONS_IMPORTANCE' => array(
+    'Help' => 'How much you care about this monitor being available.~~
+Normal: problems such as failing to connect to the camera are logged at their usual severity.~~
+Less important and Not important: those messages are logged at a lower severity, so a camera that is often switched off or out of range does not fill the log with errors.'
+  ),
+  'ZM_WEB_HOMEVIEW' => array(
+    'Help' => 'The page shown after logging in: the console, events, map, montage, montage review or watch.~~A user\'s own Home View setting overrides this.'
+  ),
+  'ZM_WEB_NAVBAR_LINKS' => array(
+    'Help' => 'Extra links to add to the navigation bar.~~Enter complete HTML a tags separated by commas, for example <a href="https://zoneminder.com">ZoneMinder</a>.'
+  ),
+  'ZM_OPT_ALS_PORT' => array(
+    'Help' => 'The port the alarm server listens on for alarms sent by a camera or other device.'
+  ),
+  'ZM_OPT_ALS_LOGENTRY' => array(
+    'Help' => 'When the alarm server receives a Human Detected alarm, add an entry to the ZoneMinder log.'
+  ),
+  'ZM_OPT_ALS_ALARM' => array(
+    'Help' => 'When the alarm server receives a Human Detected alarm, pass it on to ZoneMinder as an alarm.~~This does not work together with Trigger an event on Human Detected.'
+  ),
+  'ZM_OPT_ALS_TRIGGEREVENT' => array(
+    'Help' => 'When the alarm server receives a Human Detected alarm, trigger an event in ZoneMinder.~~Requires the zmTrigger option to be enabled.'
+  ),
+  'ZM_TELEMETRY_LAST_UPLOAD' => array(
+    'Help' => 'The time of the last telemetry upload, as a Unix timestamp. It is set by ZoneMinder after each upload and cannot be edited.'
   ),
 
 //    'LANG_DEFAULT' => array(

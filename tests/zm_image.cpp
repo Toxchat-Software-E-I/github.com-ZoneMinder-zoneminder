@@ -19,10 +19,13 @@
 
 #include "zm_config.h"
 #include "zm_image.h"
+#include "zm_poly.h"
 #include "zm_rgb.h"
 
 extern "C" {
 #include <libavutil/imgutils.h>
+#include <libavutil/pixdesc.h>
+#include <jpeglib.h>
 }
 
 #include <cstdlib>
@@ -182,6 +185,54 @@ TEST_CASE("Image::Scale YUV420P with non-32-multiple width", "[image]") {
   }
 }
 
+// zms scales the shared memory frame into a scratch image with ScaleFrom
+// instead of copying it first; the result must match copying then scaling.
+TEST_CASE("Image::ScaleFrom matches Assign then Scale", "[image]") {
+  bootstrap_image_config();
+  struct Case { int w, h; unsigned int colours, subpix; } cases[] = {
+    {1920, 1080, ZM_COLOUR_RGB32, ZM_SUBPIX_ORDER_RGBA},
+    {1920, 1080, ZM_COLOUR_GRAY8, ZM_SUBPIX_ORDER_YUV420P},
+    {1000, 562, ZM_COLOUR_RGB24, ZM_SUBPIX_ORDER_RGB},
+  };
+  for (const Case &c : cases) {
+    INFO(c.w << "x" << c.h << " colours " << c.colours);
+    Image src(c.w, c.h, c.colours, c.subpix);
+    REQUIRE(src.Buffer() != nullptr);
+    uint8_t *p = src.WriteBuffer(c.w, c.h, c.colours, c.subpix);
+    for (unsigned int i = 0; i < src.Size(); i++) p[i] = static_cast<uint8_t>((i * 31 + i / 997) % 251);
+
+    Image copied;
+    copied.Assign(src);
+    copied.Scale(c.w / 2, c.h / 2);
+
+    Image scaled;
+    scaled.ScaleFrom(src, c.w / 2, c.h / 2);
+    REQUIRE(scaled.Width() == copied.Width());
+    REQUIRE(scaled.Height() == copied.Height());
+    REQUIRE(scaled.LineSize() == copied.LineSize());
+    REQUIRE(scaled.Size() == copied.Size());
+    REQUIRE(scaled.PixFormat() == copied.PixFormat());
+    // Compare the visible bytes of each row; sws_scale leaves row padding unwritten.
+    const AVPixelFormat fmt = copied.PixFormat();
+    const int ow = copied.Width(), oh = copied.Height();
+    Planes a = plane_view(copied, fmt, ow, oh);
+    Planes b = plane_view(scaled, fmt, ow, oh);
+    const AVPixFmtDescriptor *desc = av_pix_fmt_desc_get(fmt);
+    for (int plane = 0; plane < 4 && a.data[plane]; plane++) {
+      const int rows = plane ? AV_CEIL_RSHIFT(oh, static_cast<int>(desc->log2_chroma_h)) : oh;
+      const int bytes = av_image_get_linesize(fmt, ow, plane);
+      for (int y = 0; y < rows; y++) {
+        REQUIRE(memcmp(a.data[plane] + static_cast<size_t>(y) * a.stride[plane],
+                       b.data[plane] + static_cast<size_t>(y) * b.stride[plane], bytes) == 0);
+      }
+    }
+
+    const uint8_t *buffer = scaled.Buffer();
+    scaled.ScaleFrom(src, c.w / 2, c.h / 2);
+    CHECK(scaled.Buffer() == buffer);
+  }
+}
+
 TEST_CASE("Image::Flip YUV420P", "[image]") {
   bootstrap_image_config();
   const int w = 640, h = 480;
@@ -207,6 +258,88 @@ TEST_CASE("Image::Flip YUV420P", "[image]") {
     REQUIRE(dst.data[0][(h - 1 - 20) * dst.stride[0] + 10] == 200);
     REQUIRE(dst.data[1][(h / 2 - 1 - 30) * dst.stride[1] + 40] == 210);
   }
+}
+
+// Regression: Image::Crop built a tightly packed width * colours buffer.
+// AssignDirect wants 32-byte aligned rows and, for YUV420P, the chroma planes
+// as well, so it refused that buffer whenever the cropped row wasn't a
+// multiple of 32 bytes or the image was planar: "Attempt to directly assign
+// buffer from an undersized buffer", the image stayed uncropped and the new
+// buffer leaked. nph-zms crops every frame of a zoomed live stream.
+TEST_CASE("Image::Crop YUV420P", "[image]") {
+  bootstrap_image_config();
+  const int w = 1280, h = 720;
+  Image image(w, h, ZM_COLOUR_GRAY8, ZM_SUBPIX_ORDER_YUV420P);
+
+  Planes src = plane_view(image, AV_PIX_FMT_YUV420P, w, h);
+  memset(src.data[0], 0x10, static_cast<size_t>(src.stride[0]) * h);
+  memset(src.data[1], 0x20, static_cast<size_t>(src.stride[1]) * (h / 2));
+  memset(src.data[2], 0x30, static_cast<size_t>(src.stride[2]) * (h / 2));
+  src.data[0][120 * src.stride[0] + 100] = 200;  // luma (100, 120)
+  src.data[1][61 * src.stride[1] + 51] = 210;    // U (51, 61)
+  src.data[2][62 * src.stride[2] + 52] = 220;    // V (52, 62)
+
+  // 1164x656 from (58, 32): the crop nph-zms makes at the first zoom step.
+  const unsigned int lo_x = 58, lo_y = 32, cw = 1164, ch = 656;
+  REQUIRE(image.Crop(lo_x, lo_y, lo_x + cw - 1, lo_y + ch - 1));
+  REQUIRE(image.Width() == cw);
+  REQUIRE(image.Height() == ch);
+  REQUIRE(image.Size() == static_cast<unsigned int>(
+            av_image_get_buffer_size(AV_PIX_FMT_YUV420P, cw, ch, 32)));
+
+  Planes dst = plane_view(image, AV_PIX_FMT_YUV420P, cw, ch);
+  REQUIRE(dst.data[0][(120 - lo_y) * dst.stride[0] + (100 - lo_x)] == 200);
+  REQUIRE(dst.data[1][(61 - lo_y / 2) * dst.stride[1] + (51 - lo_x / 2)] == 210);
+  REQUIRE(dst.data[2][(62 - lo_y / 2) * dst.stride[2] + (52 - lo_x / 2)] == 220);
+  REQUIRE(dst.data[1][0] == 0x20);
+  REQUIRE(dst.data[2][0] == 0x30);
+}
+
+// A YUV420P chroma sample covers 2x2 luma pixels, so a crop starting on an odd
+// luma column or row can't start its chroma with it: the chroma would be half a
+// pixel off. Crop moves the window to the even position instead, keeping its
+// size.
+TEST_CASE("Image::Crop YUV420P from an odd position keeps chroma aligned", "[image]") {
+  bootstrap_image_config();
+  const int w = 128, h = 64;
+  Image image(w, h, ZM_COLOUR_GRAY8, ZM_SUBPIX_ORDER_YUV420P);
+
+  Planes src = plane_view(image, AV_PIX_FMT_YUV420P, w, h);
+  for (int y = 0; y < h; y++)
+    for (int x = 0; x < w; x++)
+      src.data[0][y * src.stride[0] + x] = static_cast<uint8_t>(x + y);
+  for (int y = 0; y < h / 2; y++)
+    for (int x = 0; x < w / 2; x++)
+      src.data[1][y * src.stride[1] + x] = static_cast<uint8_t>(x * 2 + y);
+
+  const unsigned int lo_x = 11, lo_y = 7, cw = 40, ch = 20;
+  REQUIRE(image.Crop(lo_x, lo_y, lo_x + cw - 1, lo_y + ch - 1));
+  REQUIRE(image.Width() == cw);
+  REQUIRE(image.Height() == ch);
+
+  // Starts at (10, 6), whose chroma sample is (5, 3).
+  Planes dst = plane_view(image, AV_PIX_FMT_YUV420P, cw, ch);
+  REQUIRE(dst.data[0][0] == static_cast<uint8_t>(10 + 6));
+  REQUIRE(dst.data[1][0] == static_cast<uint8_t>(5 * 2 + 3));
+}
+
+TEST_CASE("Image::Crop RGBA with a row that is not a multiple of 32 bytes", "[image]") {
+  bootstrap_image_config();
+  const int w = 64, h = 16;
+  Image image(w, h, ZM_COLOUR_RGB32, ZM_SUBPIX_ORDER_RGBA);
+  for (int y = 0; y < h; y++)
+    for (int x = 0; x < w; x++)
+      for (int c = 0; c < 4; c++)
+        image.Buffer()[y * image.LineSize() + x * 4 + c] = static_cast<uint8_t>(y * 16 + x + c);
+
+  // 13 pixels = 52 bytes per row; AssignDirect wants 64.
+  REQUIRE(image.Crop(5, 3, 17, 10));
+  REQUIRE(image.Width() == 13u);
+  REQUIRE(image.Height() == 8u);
+  REQUIRE(image.LineSize() == 64u);
+  for (int y = 0; y < 8; y++)
+    for (int x = 0; x < 13; x++)
+      REQUIRE(image.Buffer()[y * image.LineSize() + x * 4] == static_cast<uint8_t>((y + 3) * 16 + (x + 5)));
 }
 
 // Regression: a zone alarm highlight (RGB) overlaid onto a planar YUV420P
@@ -375,4 +508,204 @@ TEST_CASE("Image::ReadJpeg reallocates for a larger JPEG", "[image]") {
   CHECK(small.LineSize() >= big_w * 4);
   CHECK(small.Size() >= small.LineSize() * big_h);
   CHECK(small.Size() > small_size);
+}
+
+
+static std::vector<JOCTET> reference_encode_yuv(const Image &image, int quality) {
+  const int w = static_cast<int>(image.Width());
+  const int h = static_cast<int>(image.Height());
+  const AVPixelFormat fmt = image.PixFormat();
+  const bool is_422 = (fmt == AV_PIX_FMT_YUV422P || fmt == AV_PIX_FMT_YUVJ422P);
+
+  uint8_t *plane[4] = {nullptr, nullptr, nullptr, nullptr};
+  int ls[4] = {0, 0, 0, 0};
+  REQUIRE(av_image_fill_arrays(plane, ls, image.Buffer(), fmt, w, h, 32) > 0);
+
+  jpeg_compress_struct cinfo;
+  jpeg_error_mgr jerr;
+  memset(&cinfo, 0, sizeof(cinfo));
+  cinfo.err = jpeg_std_error(&jerr);
+  jpeg_create_compress(&cinfo);
+
+  unsigned char *outbuf = nullptr;
+  unsigned long outsize = 0;
+  jpeg_mem_dest(&cinfo, &outbuf, &outsize);
+
+  cinfo.image_width = w;
+  cinfo.image_height = h;
+  cinfo.input_components = 3;
+  cinfo.in_color_space = JCS_YCbCr;
+
+  jpeg_set_defaults(&cinfo);
+  jpeg_set_quality(&cinfo, quality, FALSE);
+  cinfo.dct_method = JDCT_FASTEST;
+
+  jpeg_start_compress(&cinfo, TRUE);
+
+  const unsigned chroma_v_shift = is_422 ? 0u : 1u;
+  std::vector<uint8_t> tmprow(static_cast<size_t>(w) * 3);
+  JSAMPROW row_ptr = tmprow.data();
+
+  while (cinfo.next_scanline < cinfo.image_height) {
+    const unsigned y = cinfo.next_scanline;
+    const unsigned cy = y >> chroma_v_shift;
+    const uint8_t *yrow = plane[0] + static_cast<size_t>(y) * ls[0];
+    const uint8_t *urow = plane[1] + static_cast<size_t>(cy) * ls[1];
+    const uint8_t *vrow = plane[2] + static_cast<size_t>(cy) * ls[2];
+    for (int x = 0; x < w; ++x) {
+      tmprow[static_cast<size_t>(x) * 3 + 0] = yrow[x];
+      tmprow[static_cast<size_t>(x) * 3 + 1] = urow[x >> 1];
+      tmprow[static_cast<size_t>(x) * 3 + 2] = vrow[x >> 1];
+    }
+    jpeg_write_scanlines(&cinfo, &row_ptr, 1);
+  }
+
+  jpeg_finish_compress(&cinfo);
+  jpeg_destroy_compress(&cinfo);
+
+  std::vector<JOCTET> result(outbuf, outbuf + outsize);
+  free(outbuf);
+  return result;
+}
+
+static std::vector<JOCTET> reference_encode_rgb(const Image &image, int quality) {
+  const int w = static_cast<int>(image.Width());
+  const int h = static_cast<int>(image.Height());
+
+  jpeg_compress_struct cinfo;
+  jpeg_error_mgr jerr;
+  memset(&cinfo, 0, sizeof(cinfo));
+  cinfo.err = jpeg_std_error(&jerr);
+  jpeg_create_compress(&cinfo);
+
+  unsigned char *outbuf = nullptr;
+  unsigned long outsize = 0;
+  jpeg_mem_dest(&cinfo, &outbuf, &outsize);
+
+  cinfo.image_width = w;
+  cinfo.image_height = h;
+  cinfo.input_components = 3;
+  cinfo.in_color_space = JCS_RGB;
+
+  jpeg_set_defaults(&cinfo);
+  jpeg_set_quality(&cinfo, quality, FALSE);
+  cinfo.dct_method = JDCT_FASTEST;
+
+  jpeg_start_compress(&cinfo, TRUE);
+
+  JSAMPROW row_pointer = const_cast<JSAMPROW>(image.Buffer());
+  while (cinfo.next_scanline < cinfo.image_height) {
+    jpeg_write_scanlines(&cinfo, &row_pointer, 1);
+    row_pointer += image.LineSize();
+  }
+
+  jpeg_finish_compress(&cinfo);
+  jpeg_destroy_compress(&cinfo);
+
+  std::vector<JOCTET> result(outbuf, outbuf + outsize);
+  free(outbuf);
+  return result;
+}
+
+TEST_CASE("Image::EncodeJpeg raw YUV matches legacy", "[Image]") {
+  bootstrap_image_config();
+  const int quality = 75;
+
+  struct Case { int w; int h; AVPixelFormat fmt; };
+  std::vector<Case> cases = {
+    {64, 48, AV_PIX_FMT_YUV420P},
+    {64, 37, AV_PIX_FMT_YUV420P},
+    {70, 37, AV_PIX_FMT_YUV420P},
+    {69, 37, AV_PIX_FMT_YUV420P},
+    {72, 40, AV_PIX_FMT_YUV420P},
+    {17, 9, AV_PIX_FMT_YUV420P},
+    {470, 264, AV_PIX_FMT_YUV420P},
+    {633, 356, AV_PIX_FMT_YUV420P},
+    {64, 48, AV_PIX_FMT_YUV422P},
+  };
+
+  for (auto &c : cases) {
+    const bool is_422 = (c.fmt == AV_PIX_FMT_YUV422P || c.fmt == AV_PIX_FMT_YUVJ422P);
+    Image img(c.w, c.h, ZM_COLOUR_GRAY8,
+              (c.fmt == AV_PIX_FMT_YUV420P || c.fmt == AV_PIX_FMT_YUVJ420P)
+                  ? ZM_SUBPIX_ORDER_YUV420P
+                  : ZM_SUBPIX_ORDER_YUV422P);
+
+    uint8_t *plane[4] = {nullptr, nullptr, nullptr, nullptr};
+    int ls[4] = {0, 0, 0, 0};
+    REQUIRE(av_image_fill_arrays(plane, ls, img.Buffer(), c.fmt, c.w, c.h, 32) > 0);
+    const int cr = is_422 ? c.h : (c.h + 1) / 2;
+    const int cw = (c.w + 1) / 2;
+    for (int y = 0; y < c.h; ++y)
+      for (int x = 0; x < c.w; ++x)
+        plane[0][static_cast<size_t>(y) * ls[0] + x] =
+            static_cast<uint8_t>((x * 7 + y * 13) ^ 0x5a);
+    for (int y = 0; y < cr; ++y)
+      for (int x = 0; x < cw; ++x) {
+        plane[1][static_cast<size_t>(y) * ls[1] + x] =
+            static_cast<uint8_t>((x * 11 + y * 17) ^ 0x3c);
+        plane[2][static_cast<size_t>(y) * ls[2] + x] =
+            static_cast<uint8_t>((x * 19 + y * 23) ^ 0x9e);
+      }
+
+    std::vector<JOCTET> outbuf(1 << 20);
+    size_t outsize = 0;
+    REQUIRE(img.EncodeJpeg(outbuf.data(), &outsize, quality));
+    std::vector<JOCTET> actual(outbuf.begin(), outbuf.begin() + outsize);
+
+    std::vector<JOCTET> expected = reference_encode_yuv(img, quality);
+    INFO("case " << c.w << "x" << c.h);
+    REQUIRE(actual == expected);
+  }
+}
+
+TEST_CASE("Image::EncodeJpeg cached struct no raw leak", "[Image]") {
+  bootstrap_image_config();
+  const int quality = 75;
+
+  Image yuv(32, 24, ZM_COLOUR_GRAY8, ZM_SUBPIX_ORDER_YUV420P);
+  std::vector<JOCTET> buf(1 << 20);
+  size_t sz = 0;
+  REQUIRE(yuv.EncodeJpeg(buf.data(), &sz, quality));
+
+  Image rgb(32, 24, ZM_COLOUR_RGB24, ZM_SUBPIX_ORDER_RGB);
+  for (int y = 0; y < 24; ++y)
+    for (int x = 0; x < 32; ++x) {
+      uint8_t *p = rgb.Buffer() + static_cast<size_t>(y) * rgb.LineSize() + x * 3;
+      p[0] = static_cast<uint8_t>(x * 3 + y);
+      p[1] = static_cast<uint8_t>(x + y * 5);
+      p[2] = static_cast<uint8_t>(x * 7 ^ y);
+    }
+
+  std::vector<JOCTET> outbuf(1 << 20);
+  size_t outsize = 0;
+  REQUIRE(rgb.EncodeJpeg(outbuf.data(), &outsize, quality));
+  std::vector<JOCTET> actual(outbuf.begin(), outbuf.begin() + outsize);
+  std::vector<JOCTET> expected = reference_encode_rgb(rgb, quality);
+  REQUIRE(actual == expected);
+}
+
+TEST_CASE("Image::Fill polygon writes the expected pixels for each density", "[image]") {
+  bootstrap_image_config();
+  const int w = 16, h = 12;
+  // U shape: rows 1-6 have two spans (x 1-4, 8-11), rows 7-9 one span (x 1-11).
+  Polygon poly(std::vector<Vector2>{{1, 1}, {4, 1}, {4, 7}, {8, 7}, {8, 1}, {11, 1}, {11, 10}, {1, 10}});
+
+  struct Format { int colours; int order; int bpp; };
+  for (Format f : {Format{ZM_COLOUR_GRAY8, ZM_SUBPIX_ORDER_NONE, 1},
+                   Format{ZM_COLOUR_RGB24, ZM_SUBPIX_ORDER_RGB, 3},
+                   Format{ZM_COLOUR_RGB32, ZM_SUBPIX_ORDER_RGBA, 4}}) {
+    for (int density : {1, 2, 3}) {
+      Image image(w, h, f.colours, f.order);
+      memset(image.Buffer(), 0, image.Size());
+      image.Fill(0xFF, density, poly);
+      for (int y = 0; y < h; y++) {
+        for (int x = 0; x < w; x++) {
+          bool inside = y >= 1 && y <= 9 && ((x >= 1 && x <= 4) || (x >= 8 && x <= 11) || (y >= 7 && x >= 1 && x <= 11));
+          bool expected = inside && x % density == 0 && y % density == 0;
+          REQUIRE((image.Buffer()[y * image.LineSize() + x * f.bpp] != 0) == expected);
+        }
+      }
+    }
+  }
 }

@@ -71,6 +71,7 @@ Options for use with monitors:
   -f, --fps                               - Output last Frames Per Second captured reading
   -z, --zones                             - Write last captured image overlaid with zones to <monitor_name>-Zones.jpg
   -a, --alarm                             - Force alarm in monitor, this will trigger recording until cancelled with -c
+      --cause <text>                      - With --alarm, the cause recorded on the event, default "Forced Web"
   -n, --noalarm                           - Force no alarms in monitor, this will prevent alarms until cancelled with -c
   -c, --cancel                            - Cancel a forced alarm/noalarm in monitor, required after being enabled with -a or -n
   -L, --reload                            - Signal monitor to reload settings
@@ -128,6 +129,7 @@ void Usage(int status=-1) {
     "  -f, --fps            : Output last Frames Per Second captured reading\n"
     "  -z, --zones          : Write last captured image overlaid with zones to <monitor_name>-Zones.jpg\n"
     "  -a, --alarm          : Force alarm in monitor, this will trigger recording until cancelled with -c\n"
+    "      --cause <text>     : With --alarm, the cause recorded on the event, default \"Forced Web\"\n"
     "  -n, --noalarm          : Force no alarms in monitor, this will prevent alarms until cancelled with -c\n"
     "  -c, --cancel           : Cancel a forced alarm/noalarm in monitor, required after being enabled with -a or -n\n"
     "  -L, --reload           : Signal monitor to reload settings\n"
@@ -173,6 +175,9 @@ typedef enum {
   ZMU_TRIGGER    = 0x20000000,
   ZMU_JANUS      = 0x40000000,
 } Function;
+
+// getopt_long value for --cause, which has no short form
+static const int ZMU_OPT_CAUSE = 256;
 
 bool ValidateAccess(User *user, int mon_id, int function) {
   bool allowed = true;
@@ -230,13 +235,14 @@ int main(int argc, char *argv[]) {
     {"brightness", 2, nullptr, 'B'},
     {"contrast", 2, nullptr, 'C'},
     {"hue", 2, nullptr, 'H'},
-    {"contrast", 2, nullptr, 'O'},
+    {"colour", 2, nullptr, 'O'},
     {"read_index", 0, nullptr, 'R'},
     {"write_index", 0, nullptr, 'W'},
     {"event", 0, nullptr, 'e'},
     {"fps", 0, nullptr, 'f'},
     {"zones", 2, nullptr, 'z'},
     {"alarm", 0, nullptr, 'a'},
+    {"cause", 1, nullptr, ZMU_OPT_CAUSE},
     {"noalarm", 0, nullptr, 'n'},
     {"cancel", 0, nullptr, 'c'},
     {"reload", 0, nullptr, 'L'},
@@ -275,6 +281,7 @@ int main(int argc, char *argv[]) {
   bool have_colour = false;
 
   char *zoneString = nullptr;
+  std::string alarm_cause = "Forced Web";
   std::string username;
   std::string password;
   char *auth = nullptr;
@@ -285,7 +292,7 @@ int main(int argc, char *argv[]) {
   while (1) {
     int option_index = 0;
 
-    int c = getopt_long(argc, argv, "d:m:vsjEDLurweix::S:t::fz::ancqhlB::C::H::O::RWU:P:A:V:T:", long_options, &option_index);
+    int c = getopt_long(argc, argv, "d:m:vsjEDLurwei::xS:t::fz::ancqhlB::C::H::O::RWU:P:A:V:T:", long_options, &option_index);
     if (c == -1) {
       break;
     }
@@ -342,6 +349,10 @@ int main(int argc, char *argv[]) {
       break;
     case 'a':
       function |= ZMU_ALARM;
+      break;
+    case ZMU_OPT_CAUSE:
+      if (optarg && *optarg)
+        alarm_cause = optarg;
       break;
     case 'n':
       function |= ZMU_NOALARM;
@@ -413,8 +424,10 @@ int main(int argc, char *argv[]) {
       break;
 #endif // ZM_HAS_V4L2
     case 'h':
-    case '?':
       Usage(0);
+      break;
+    case '?':
+      Usage(1);
       break;
     case 'l':
       function |= ZMU_LIST;
@@ -639,7 +652,7 @@ int main(int argc, char *argv[]) {
 
       // Ensure that we are not recording.  So the forced alarm is distinct from what was recording before
       monitor->ForceAlarmOff();
-      monitor->ForceAlarmOn(config.forced_alarm_score, "Forced Web");
+      monitor->ForceAlarmOn(config.forced_alarm_score, alarm_cause.c_str());
 
       Microseconds wait_time = Seconds(10);
       while ((monitor->GetState() != Monitor::ALARM) and !zm_terminate and wait_time > Seconds(0)) {

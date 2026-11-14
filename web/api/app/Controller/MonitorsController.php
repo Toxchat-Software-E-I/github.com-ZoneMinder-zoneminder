@@ -33,7 +33,16 @@ class MonitorsController extends AppController {
 
     if ($this->request->params['named']) {
       $this->FilterComponent = $this->Components->load('Filter');
-      $conditions = $this->FilterComponent->buildFilter($this->request->params['named']);
+      // The columns of Monitors and of the tables find() joins at recursive 0
+      // (hasOne, belongsTo), plus GroupId, served by the Groups_Monitors join
+      // below. Anything else would reach MySQL as an unknown column and come
+      // back as a 500.
+      $fields = array('Monitor' => array_keys($this->Monitor->schema()));
+      foreach (array_merge(array_keys($this->Monitor->hasOne), array_keys($this->Monitor->belongsTo)) as $alias) {
+        $fields[$alias] = array_keys($this->Monitor->{$alias}->schema());
+      }
+      $named = $this->FilterComponent->qualifyFields($this->request->params['named'], $fields, array('GroupId'));
+      $conditions = $this->FilterComponent->buildFilter($named);
     } else {
       $conditions = array();
     }
@@ -126,6 +135,17 @@ class MonitorsController extends AppController {
  *
  * @return void
  */
+  // The EventStartCommand / EventEndCommand values the request supplies, if any.
+  private function requestCommandFields() {
+    require_once __DIR__ .'/../../../includes/Monitor.php';
+    $fields = array();
+    foreach (ZM\Monitor::$commandFields as $field) {
+      $value = $this->requestField('Monitor', $field);
+      if ($value !== null) $fields[$field] = $value;
+    }
+    return $fields;
+  }
+
   public function add() {
     if ( $this->request->is('post') ) {
 
@@ -134,6 +154,12 @@ class MonitorsController extends AppController {
       if ( !$canAdd ) {
         throw new UnauthorizedException(__('Insufficient privileges'));
         return;
+      }
+      // A new monitor's command fields start empty, so any value is a change.
+      require_once __DIR__ .'/../../../includes/Monitor.php';
+      $new_monitor = new ZM\Monitor();
+      if (count($new_monitor->commandFieldChangesNotAllowed($this->requestCommandFields()))) {
+        throw new UnauthorizedException(__('Setting the event commands requires System edit permission'));
       }
       $this->pinRequestId($this->Monitor, null);
       $this->Monitor->create();
@@ -178,20 +204,36 @@ class MonitorsController extends AppController {
       throw new UnauthorizedException(__('Insufficient Privileges'));
       return;
     }
+    if (count($zm_monitor->commandFieldChangesNotAllowed($this->requestCommandFields()))) {
+      throw new UnauthorizedException(__('Changing the event commands requires System edit permission'));
+    }
 
     $this->pinRequestId($this->Monitor, $id);
     $message = '';
     if ($this->Monitor->save($this->request->data)) {
       $message = 'Saved';
 
-      // Stop the monitor. Should happen before saving
-      $this->Monitor->daemonControl($monitor, 'stop');
-      $monitor = $this->Monitor->find('first', array(
+      // Restart the daemons the way the console's save does
+      // (includes/actions/monitor.php): zmc, and the control server of a
+      // controllable monitor, which otherwise keeps the ControlAddress,
+      // ControlDevice and Control it read when it started. ZM\Monitor sends
+      // the commands to the monitor's own server in a multi-server setup.
+      // Stopped with the old row, started with the saved one.
+      if ($zm_monitor->Type() != 'WebSite') {
+        $zm_monitor->zmcControl('stop');
+        if ($zm_monitor->Controllable()) {
+          $zm_monitor->sendControlCommand('stop');
+        }
+      }
+      $saved = new ZM\Monitor($this->Monitor->find('first', array(
         'conditions' => array('Id' => $id)
-      ))['Monitor'];
-
-      if ($monitor['Capturing'] != 'None')
-        $this->Monitor->daemonControl($monitor, 'start');
+      ))['Monitor']);
+      if ($saved->Capturing() != 'None' and $saved->Type() != 'WebSite' and !$saved->Deleted()) {
+        $saved->zmcControl('start');
+        if ($saved->Controllable()) {
+          $saved->sendControlCommand('start');
+        }
+      }
     } else {
       $message = 'Error ' . print_r($this->Monitor->invalidFields(), true);
     }
@@ -223,9 +265,12 @@ class MonitorsController extends AppController {
     }
     $this->request->allowMethod('post', 'delete');
 
-    $this->runDaemonControl($this->Monitor->id, 'stop');
-
-    if ( $this->Monitor->delete() ) {
+    // Delete the way the console does: ZM\Monitor::delete() stops zmc and
+    // zmcontrol and marks the monitor Deleted. A hard delete of the row left
+    // its events pointing at a monitor that no longer exists.
+    require_once __DIR__ .'/../../../includes/Monitor.php';
+    $monitor = new ZM\Monitor($id);
+    if ( $monitor->delete() ) {
       return $this->flash(__('The monitor has been deleted.'), array('action' => 'index'));
     } else {
       return $this->flash(__('The monitor could not be deleted. Please, try again.'), array('action' => 'index'));
@@ -246,10 +291,31 @@ class MonitorsController extends AppController {
     ));
   }
 
+  // The cause given to alarm on, as zmu records it: letters, digits, spaces and plain
+  // punctuation only, at most 31 bytes (the size of the shared trigger_cause field), cut on
+  // a character boundary. The cause is stored as the event's Cause and in its Notes, so it
+  // is kept to plain text: markup, quotes, backslashes and control characters are dropped.
+  // Returns '' when nothing usable is left, which keeps the default "Forced Web".
+  private function alarmCause($cause) {
+    if (!is_string($cause)) return '';
+    // Fails (null) on invalid UTF-8
+    $cause = preg_replace('/[^\p{L}\p{M}\p{N} _.,:;!?()\[\]\/+#@%=-]+/u', '', $cause);
+    if ($cause === null) return '';
+    $cause = trim(preg_replace('/ {2,}/', ' ', $cause));
+    $cut = '';
+    foreach (preg_split('//u', $cause, -1, PREG_SPLIT_NO_EMPTY) as $char) {
+      if (strlen($cut) + strlen($char) > 31) break;
+      $cut .= $char;
+    }
+    return rtrim($cut);
+  }
+
   // arm/disarm alarms
   // expected format: http(s):/portal-api-url/monitors/alarm/id:M/command:C.json
   // where M=monitorId
   // where C=on|off|status|disable
+  // command:on takes an optional cause (query or POST data), recorded on the event in
+  // place of "Forced Web" after alarmCause() has filtered it
   public function alarm() {
     $id = $this->request->params['named']['id'];
     if ( !$this->Monitor->exists($id) ) {
@@ -261,6 +327,18 @@ class MonitorsController extends AppController {
       case 'on':
         $q = '-a';
         $verbose = '-v';
+        // Read cause from the query string, falling back to POST data. Compare to
+        // null rather than testing truthiness so a literal "0" is not discarded.
+        $cause_raw = $this->request->query('cause');
+        if ($cause_raw === null) $cause_raw = $this->request->data('cause');
+        $cause = $this->alarmCause($cause_raw);
+        if ($cause !== '') {
+          // Wrap in single quotes with POSIX quote escaping rather than
+          // escapeshellarg(), which drops bytes that are invalid in the server's
+          // locale and so mangles a UTF-8 cause under a C/POSIX locale. This stays
+          // safe independently of what alarmCause() lets through.
+          $q .= " --cause '".str_replace("'", "'\\''", $cause)."'";
+        }
         break;
       case 'off':
         $q = '-c';
@@ -286,44 +364,14 @@ class MonitorsController extends AppController {
       throw new UnauthorizedException(__('Insufficient Privileges'));
     }
 
-    // form auth key based on auth credentials
-    $auth = '';
-    
-    if (ZM_OPT_USE_AUTH) {
-      global $user;
-      $mToken = $this->request->query('token') ? $this->request->query('token') : $this->request->data('token');;
-      if ($mToken) {
-        $auth = ' -T '.escapeshellarg($mToken);
-      } else if (ZM_AUTH_RELAY == 'hashed') {
-        $auth = ' -A '.calculateAuthHash(''); # Can't do REMOTE_IP because zmu doesn't normally have access to it.
-      } else if (ZM_AUTH_RELAY == 'plain') {
-        # Plain requires the plain text password which must either be in request or stored in session
-        $password = $this->request->query('pass') ? $this->request->query('pass') : $this->request->data('pass');;
-        if (!$password) 
-          $password = $this->request->query('password') ? $this->request->query('password') : $this->request->data('password');
-
-        if (!$password) {
-          # during auth the session will have been populated with the plaintext password
-          $stateful = $this->request->query('stateful') ? $this->request->query('stateful') : $this->request->data('stateful');
-          if ($stateful) {
-            $password = $_SESSION['password'];
-          }
-        } else if ($_COOKIE['ZMSESSID']) {
-          $password = $_SESSION['password'];
-        }
-
-        $auth = ' -U '.escapeshellarg($user->Username()).' -P '.escapeshellarg($password);
-      } else if (ZM_AUTH_RELAY == 'none') {
-        $auth = ' -U '.escapeshellarg($user->Username());
-      }
-    }
-
     $shellcmd = ZM_PATH_BIN.'/zmu'
       .($verbose ? " $verbose" : '')
       .' -m'.escapeshellarg($id)
-      ." $q"
-      .$auth;
-    $status = exec($shellcmd, $output, $rc);
+      ." $q";
+    $password = $this->request->query('pass') ? $this->request->query('pass') : $this->request->data('pass');
+    if (!$password) $password = $this->request->query('password') ? $this->request->query('password') : $this->request->data('password');
+    $status = exec($shellcmd.zmuCredentials($password ? $password : null), $output, $rc);
+    // Logged without the credentials.
     ZM\Debug("Command: $shellcmd output: ".implode(PHP_EOL, $output)." rc: $rc");
     if ($rc) {
       $this->set(array(
@@ -436,12 +484,12 @@ class MonitorsController extends AppController {
     $status = exec($command);
     ZM\Debug("Command: $command output: $status");
 
-    // If 'not' is present, the daemon is not running, so return false
+    // Only "running since" or "pending at" mean running; no answer means zmdc is down.
     // https://github.com/ZoneMinder/ZoneMinder/issues/799#issuecomment-108996075
     // Also sending back the status text so we can check if the monitor is in pending
     // state which means there may be an error
     $statustext = $status;
-    $status = (strpos($status, 'not')) ? false : true;
+    $status = (preg_match('/ (running since|pending at) /', $status) === 1);
 
     $this->set(array(
       'status' => $status,

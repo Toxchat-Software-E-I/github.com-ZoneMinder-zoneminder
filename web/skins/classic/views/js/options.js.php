@@ -2,7 +2,7 @@
 global $restartWarning;
 global $tab;
 ?>
-  const tab = '<?php echo $tab ?>';
+  const tab = '<?php echo validJsStr($tab) ?>';
 const menuItemStrings = {
   menuKey: <?php echo json_encode(translate('Name')) ?>,
   label: <?php echo json_encode(translate('Custom Label')) ?>,
@@ -12,5 +12,6 @@ const menuItemStrings = {
 var restartWarning = <?php echo empty($restartWarning)?'false':'true' ?>;
 if ( restartWarning ) {
   alert( "<?php echo translate('OptionRestartWarning') ?>" );
+  history.replaceState(null, '', location.href.replace('&restart=1', ''));
 }
 

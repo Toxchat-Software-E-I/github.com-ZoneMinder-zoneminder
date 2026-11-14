@@ -191,12 +191,10 @@ function probeActi($ip) {
   $camera = array(
     'model'   => 'Unknown Panasonic Camera',
     'monitor' => array(
-      'Type'     => 'Remote',
-      'Protocol' => 'rtsp',
-      'Method'   => 'rtpUni',
-      'Host'     => 'Admin:123456@'.$ip,
-      'Port'     => 7070,
-      'Path'     => '',
+      // Was Remote/rtsp, which no longer captures now that ZoneMinder's own
+      // rtsp client is gone. Same stream, through ffmpeg.
+      'Type'     => 'Ffmpeg',
+      'Path'     => 'rtsp://Admin:123456@'.$ip.':7070',
       'Colours'  => 3,
       'Width'    => 320,
       'Height'   => 240,
@@ -250,12 +248,10 @@ function probeVivotek($ip) {
   $camera = array(
     'model'   => 'Unknown Vivotek Camera',
     'monitor' => array(
-      'Type'     => 'Remote',
-      'Protocol' => 'rtsp',
-      'Method'   => 'rtpUni',
-      'Host'     => $ip,
-      'Port'     => 554,
-      'Path'     => '',
+      // Was Remote/rtsp, which no longer captures now that ZoneMinder's own
+      // rtsp client is gone. Same stream, through ffmpeg.
+      'Type'     => 'Ffmpeg',
+      'Path'     => 'rtsp://'.$ip.':554',
       'Colours'  => 3,
       'Width'    => 352,
       'Height'   => 240,
@@ -366,7 +362,7 @@ function probeNetwork() {
       ZM\Debug("Ffmpeg monitor {$url_parts['host']} = {$monitor['Id']} {$monitor['Name']}");
       $monitors[gethostbyname($url_parts['host'])] = $monitor;
     } else {
-      ZM\Debug("Unable to parse {$monitor['Path']}");
+      ZM\Debug('Unable to parse '.ZM\urlForLog($monitor['Path']));
     }
   }
 

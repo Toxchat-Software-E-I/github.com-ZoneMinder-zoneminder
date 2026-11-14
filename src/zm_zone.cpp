@@ -118,6 +118,17 @@ Zone::~Zone() {
   delete[] ranges;
 }
 
+// Counts the kBlack pixels at the start of p, eight at a time while it can.
+static int leading_black(const uint8_t *p, int count) {
+  int i = 0;
+  for (uint64_t word; i + 8 <= count; i += 8) {
+    memcpy(&word, p + i, sizeof(word));
+    if (word) break;
+  }
+  while (i < count && p[i] == kBlack) i++;
+  return i;
+}
+
 void Zone::RecordStats(const Event *event) {
   std::string sql = stringtf(
                       "INSERT INTO Stats SET MonitorId=%d, ZoneId=%d, EventId=%" PRIu64 ", FrameId=%d, "
@@ -289,14 +300,33 @@ bool Zone::CheckAlarms(const Image *delta_image) {
     return false;
   }
 
-  // Zero the bbox rows so filter/blob stages see kBlack for pixels outside
-  // each row's per-polygon ranges. alarmedpixels_row will write kWhite/kBlack
-  // for pixels inside the ranges.
-  memset(diff_buff + (lo_y * diff_width), 0, static_cast<size_t>(hi_y - lo_y + 1) * diff_width);
+  // Zero only the bbox pixels alarmedpixels_row will not overwrite, so the
+  // filter/blob stages still see kBlack outside each row's polygon range.
+  for (int y = lo_y; y <= hi_y; y++) {
+    const int lo_x = ranges[y].lo_x;
+    const int hi_x = ranges[y].hi_x;
+    pdiff = diff_buff + (y * diff_width);
+
+    if (lo_x < 0 || lo_x > hi_x) {
+      memset(pdiff, 0, diff_width);
+      continue;
+    }
+
+    // Same clamp as std_alarmedpixels.
+    const int clamped_hi_x = (hi_x >= diff_width) ? diff_width - 1 : hi_x;
+
+    if (lo_x > 0) {
+      memset(pdiff, 0, (lo_x < diff_width) ? static_cast<size_t>(lo_x) : static_cast<size_t>(diff_width));
+    }
+    if (clamped_hi_x < diff_width - 1) {
+      memset(pdiff + clamped_hi_x + 1, 0, static_cast<size_t>(diff_width - clamped_hi_x - 1));
+    }
+  }
 
   Debug(4, "Checking alarms for zone %d/%s in lines %d -> %d", id, label.c_str(), lo_y, hi_y);
 
-  std_alarmedpixels(delta_image, diff_image, pg_image, &stats.alarm_pixels_, &pixel_diff_count);
+  Box alarmed_box;
+  std_alarmedpixels(delta_image, diff_image, pg_image, &stats.alarm_pixels_, &pixel_diff_count, &alarmed_box);
 
   if (config.record_diag_images) {
     diff_image->WriteJpeg(diag_path, config.record_diag_images_fifo);
@@ -332,6 +362,13 @@ bool Zone::CheckAlarms(const Image *delta_image) {
     stats.score_ = 1; /* Fix for score of 0 when frame meets thresholds but alarmed area is not big enough */
   Debug(5, "Current score is %d", stats.score_);
 
+  alarm_lo_x = alarmed_box.Lo().x_;
+  alarm_lo_y = alarmed_box.Lo().y_;
+  alarm_hi_x = alarmed_box.Hi().x_;
+  alarm_hi_y = alarmed_box.Hi().y_;
+  alarm_mid_x = (alarm_hi_x+alarm_lo_x+1)/2;
+  alarm_mid_y = (alarm_hi_y+alarm_lo_y+1)/2;
+
   if (check_method >= FILTERED_PIXELS) {
     int bx = filter_box.x_;
     int by = filter_box.y_;
@@ -344,6 +381,7 @@ bool Zone::CheckAlarms(const Image *delta_image) {
       unsigned char *cpdiff;
       int ldx, hdx, ldy, hdy;
       bool block;
+      int filter_lo_x = diff_width, filter_hi_x = -1, filter_lo_y = diff_height, filter_hi_y = -1;
       for (int y = lo_y; y <= hi_y; y++) {
         int lo_x = ranges[y].lo_x;
         int hi_x = ranges[y].hi_x;
@@ -379,9 +417,19 @@ bool Zone::CheckAlarms(const Image *delta_image) {
               continue;
             }
             stats.alarm_filter_pixels_++;
+            if (x < filter_lo_x) filter_lo_x = x;
+            if (x > filter_hi_x) filter_hi_x = x;
+            if (y < filter_lo_y) filter_lo_y = y;
+            if (y > filter_hi_y) filter_hi_y = y;
           }  // end if white
         }  // end for x
       }  // end foreach y line
+      if (stats.alarm_filter_pixels_) {
+        alarm_lo_x = filter_lo_x;
+        alarm_hi_x = filter_hi_x;
+        alarm_lo_y = filter_lo_y;
+        alarm_hi_y = filter_hi_y;
+      }
     } else {
       stats.alarm_filter_pixels_ = stats.alarm_pixels_;
     }
@@ -439,6 +487,10 @@ bool Zone::CheckAlarms(const Image *delta_image) {
 
         pdiff = diff_image->Buffer(lo_x, y);
         for (int x = lo_x; x <= hi_x; x++, pdiff++) {
+          const int black = leading_black(pdiff, hi_x - x + 1);
+          x += black;
+          pdiff += black;
+          if (x > hi_x) break;
           if (*pdiff == kWhite) {
             Debug(9, "Got white pixel at %d,%d (%p)", x, y, pdiff);
 
@@ -914,6 +966,23 @@ bool Zone::ParsePercentagePolygon(const char *poly_string, unsigned int width, u
   return false;
 }  // end bool Zone::ParsePercentagePolygon
 
+// Clamp every vertex to [0, width-1] x [0, height-1], as ParsePercentagePolygon
+// does for percentage coordinates. Returns true if any vertex was moved.
+bool Zone::ClampPolygon(Polygon &polygon, unsigned int width, unsigned int height) {
+  bool clamped = false;
+  std::vector<Vector2> vertices = polygon.GetVertices();
+  for (Vector2 &vertex : vertices) {
+    int32 x = std::clamp(vertex.x_, static_cast<int32>(0), static_cast<int32>(width) - 1);
+    int32 y = std::clamp(vertex.y_, static_cast<int32>(0), static_cast<int32>(height) - 1);
+    if (x != vertex.x_ || y != vertex.y_) {
+      vertex = Vector2(x, y);
+      clamped = true;
+    }
+  }
+  if (clamped) polygon = Polygon(vertices);
+  return clamped;
+}  // end bool Zone::ClampPolygon
+
 bool Zone::ParseZoneString(const char *zone_string, unsigned int &zone_id, int &colour, Polygon &polygon) {
   Debug(3, "Parsing zone string '%s'", zone_string);
 
@@ -950,6 +1019,46 @@ bool Zone::ParseZoneString(const char *zone_string, unsigned int &zone_id, int &
 
   return result;
 }  // end bool Zone::ParseZoneString(const char *zone_string, int &zone_id, int &colour, Polygon &polygon)
+
+bool Zone::ParseCoords(const char *Coords, unsigned int width, unsigned int height, Polygon &polygon, bool &clamped) {
+  clamped = false;
+  // Auto-detect coordinate format: decimal points mean percentages,
+  // integer-only means legacy pixel values. Units field is not trusted.
+  if (strchr(Coords, '.')) {
+    return ParsePercentagePolygon(Coords, width, height, polygon);
+  }
+  if (!ParsePolygonString(Coords, polygon)) return false;
+  // Pixel coordinates are not scaled to the monitor, so they can lie outside
+  // it (zone drawn at a larger size, or written through the API). Setup()
+  // rasterises the polygon into a monitor-sized image.
+  clamped = ClampPolygon(polygon, width, height);
+  return true;
+}
+
+// Number of zones Load() would produce, without constructing them.
+size_t Zone::Count(const std::shared_ptr<Monitor> &monitor) {
+  std::string sql = stringtf("SELECT Id,Name,Coords FROM Zones WHERE MonitorId = %d", monitor->Id());
+
+  MYSQL_RES *result = zmDbFetch(sql);
+  if (!result) {
+    return 0;
+  }
+
+  size_t count = 0;
+  for (MYSQL_ROW dbrow = mysql_fetch_row(result); dbrow; dbrow = mysql_fetch_row(result)) {
+    const char *Coords = dbrow[2];
+    Polygon polygon;
+    bool clamped;
+    if (!ParseCoords(Coords, monitor->Width(), monitor->Height(), polygon, clamped)) {
+      Error("Unable to parse polygon string '%s' for zone %d/%s for monitor %s, ignoring",
+            Coords, atoi(dbrow[0]), dbrow[1], monitor->Name());
+      continue;
+    }
+    count++;
+  }
+  mysql_free_result(result);
+  return count;
+}
 
 std::vector<Zone> Zone::Load(const std::shared_ptr<Monitor> &monitor) {
   std::string sql = stringtf("SELECT Id,Name,Type+0,Units,Coords,AlarmRGB,CheckMethod+0,"
@@ -1013,24 +1122,17 @@ std::vector<Zone> Zone::Load(const std::shared_ptr<Monitor> &monitor) {
     /* HTML colour code is actually BGR in memory, we want RGB */
     AlarmRGB = rgb_convert(AlarmRGB, ZM_SUBPIX_ORDER_BGR);
 
-    // Auto-detect coordinate format: decimal points mean percentages,
-    // integer-only means legacy pixel values. Units field is not trusted.
     Debug(5, "Parsing polygon %s (Units=%s)", Coords, Units);
     Polygon polygon;
-    if (strchr(Coords, '.')) {
-      // Decimal values present — treat as percentages regardless of Units field
-      if (!ParsePercentagePolygon(Coords, monitor->Width(), monitor->Height(), polygon)) {
-        Error("Unable to parse polygon string '%s' for zone %d/%s for monitor %s, ignoring",
-              Coords, Id, Name, monitor->Name());
-        continue;
-      }
-    } else {
-      // Integer-only coordinates — treat as pixel values
-      if (!ParsePolygonString(Coords, polygon)) {
-        Error("Unable to parse polygon string '%s' for zone %d/%s for monitor %s, ignoring",
-              Coords, Id, Name, monitor->Name());
-        continue;
-      }
+    bool clamped = false;
+    if (!ParseCoords(Coords, monitor->Width(), monitor->Height(), polygon, clamped)) {
+      Error("Unable to parse polygon string '%s' for zone %d/%s for monitor %s, ignoring",
+            Coords, Id, Name, monitor->Name());
+      continue;
+    }
+    if (clamped) {
+      Warning("Zone %d/%s for monitor %s has coordinates '%s' outside %ux%u, clamping",
+              Id, Name, monitor->Name(), Coords, monitor->Width(), monitor->Height());
     }
 
     // Convert threshold values from DB format to pixel counts for runtime use.
@@ -1143,7 +1245,8 @@ void Zone::std_alarmedpixels(
   Image* pmask_image,
   const Image* ppoly_image,
   unsigned int* pixel_count,
-  unsigned int* pixel_sum) {
+  unsigned int* pixel_sum,
+  Box* alarmed_box) {
   uint32_t pixelsalarmed = 0;
   uint32_t pixelsdifference = 0;
 
@@ -1161,6 +1264,8 @@ void Zone::std_alarmedpixels(
   if (hi_y >= img_height) hi_y = img_height - 1;
   if (lo_y > hi_y) { *pixel_count = 0; *pixel_sum = 0; return; }
 
+  int box_lo_x = img_width, box_hi_x = -1, box_lo_y = img_height, box_hi_y = -1;
+
   for (int y = lo_y; y <= hi_y; y++) {
     const int lo_x = ranges[y].lo_x;
     const int hi_x = ranges[y].hi_x;
@@ -1170,18 +1275,32 @@ void Zone::std_alarmedpixels(
     // Clamp hi_x to image width
     const int clamped_hi_x = (hi_x >= img_width) ? img_width - 1 : hi_x;
 
+    const uint32_t alarmed_before = pixelsalarmed;
+    const int count = clamped_hi_x - lo_x + 1;
+    const uint8_t *pmask = pmask_image->Buffer(lo_x, y);
     alarmedpixels_row(
         pdelta_image->Buffer(lo_x, y),
         pmask_image->Buffer(lo_x, y),
         ppoly_image->Buffer(lo_x, y),
-        clamped_hi_x - lo_x + 1,
+        count,
         calc_min, calc_max,
         pixelsalarmed, pixelsdifference);
+
+    if (pixelsalarmed != alarmed_before) {
+      int last = count - 1;
+      while (pmask[last] == kBlack) last--;
+      const int first = leading_black(pmask, count);
+      if (lo_x + first < box_lo_x) box_lo_x = lo_x + first;
+      if (lo_x + last > box_hi_x) box_hi_x = lo_x + last;
+      if (y < box_lo_y) box_lo_y = y;
+      box_hi_y = y;
+    }
   }  // end for y = lo_y to hi_y
 
   /* Store the results */
   *pixel_count = pixelsalarmed;
   *pixel_sum = pixelsdifference;
+  if (pixelsalarmed) *alarmed_box = Box(Vector2(box_lo_x, box_lo_y), Vector2(box_hi_x, box_hi_y));
   Debug(7, "STORED pixelsalarmed(%d), pixelsdifference(%d)", pixelsalarmed, pixelsdifference);
 }  // end void Zone::std_alarmedpixels
 

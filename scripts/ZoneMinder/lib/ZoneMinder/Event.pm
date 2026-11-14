@@ -46,6 +46,7 @@ require POSIX;
 use Date::Format qw(time2str);
 use Time::HiRes qw(gettimeofday tv_interval stat);
 use Scalar::Util qw(looks_like_number);
+use List::Util ();
 
 #our @ISA = qw(ZoneMinder::Object);
 use parent qw(ZoneMinder::Object);
@@ -310,7 +311,9 @@ sub GenerateVideo {
   if ( $overwrite || !-s $video_file ) {
     Info("Creating video file $video_file for event $self->{Id}");
 
-    my $frame_rate = sprintf('%.2f', $self->{Frames}/$self->{FullLength});
+    # A single frame spans no time and an event without Frames rows has no FullLength.
+    my $full_length = $self->{FullLength} || $self->{Length};
+    my $frame_rate = $full_length ? sprintf('%.2f', $self->{Frames}/$full_length) : 1;
     if ( $rate ) {
       if ( $rate != 1.0 ) {
         $frame_rate *= $rate;
@@ -319,14 +322,14 @@ sub GenerateVideo {
       $frame_rate = $fps;
     }
 
-    my $width = $self->{Width};
-    my $height = $self->{Height};
-    my $video_size = "${width}x${height}";
+    # Left empty to keep the input size, which a rotating transform changes.
+    my $video_size = '';
 
     if ( $scale ) {
       if ( $scale != 1.0 ) {
-        $width = int($width*$scale);
-        $height = int($height*$scale);
+        # libx264 refuses odd dimensions
+        my $width = int($self->{Width}*$scale/2)*2;
+        my $height = int($self->{Height}*$scale/2)*2;
         $video_size = "${width}x${height}";
       }
     } elsif ( $size ) {
@@ -350,8 +353,8 @@ sub GenerateVideo {
       # each, so they are split on whitespace rather than passed as one word.
       grep { $_ ne '' } split(/\s+/, $Config{ZM_FFMPEG_INPUT_OPTIONS}),
       '-i', $input_file,
-      (map { ('-vf', $_) } @transforms),
-      '-s', $video_size,
+      (@transforms ? ('-vf', join(',', @transforms)) : ()),
+      ($video_size ne '' ? ('-s', $video_size) : ()),
       grep { $_ ne '' } split(/\s+/, $Config{ZM_FFMPEG_OUTPUT_OPTIONS}),
       $video_file,
     );
@@ -376,6 +379,7 @@ sub GenerateVideo {
     my $status = $? >> 8;
     if ( $status ) {
       Error("Unable to generate video, check $event_path/ffmpeg.log for details");
+      unlink($video_file);
       return;
     }
 
@@ -500,10 +504,10 @@ sub delete {
     $event->Storage()->adjust_diskspace(-$event->DiskSpace()) if $event->DiskSpace();
   }
 
-  if ( ( $in_zmaudit or (!$Config{ZM_OPT_FAST_DELETE})) and $event->Storage()->DoDelete() ) {
+  if ( $event->Storage()->DoDelete() ) {
     $event->delete_files();
   } else {
-    Debug('Not deleting event files from '.$event->Path().' for speed.');
+    Debug('Not deleting event files from '.$event->Path().' because the storage area has DoDelete off.');
   }
 } # end sub delete
 
@@ -611,7 +615,15 @@ sub delete_analysis_jpegs {
     if ( $event_path ) {
       ( $storage_path ) = ( $storage_path =~ /^(.*)$/ ); # De-taint
       ( $event_path ) = ( $event_path =~ /^(.*)$/ ); # De-taint
-      my @files = glob("$storage_path/$event_path/*analyse.jpg");
+      my @files;
+      my $dir = "$storage_path/$event_path";
+      if ( opendir(my $dh, $dir) ) {
+        @files = grep(/^\d+-analyse\.jpg$/, readdir($dh));
+        closedir($dh);
+      } else {
+        Error("Unable to open $dir: $!");
+        next;
+      }
       Debug(@files . ' analysis jpegs found to delete');
       foreach my $file (@files) {
         $Storage->delete_path($event_path.'/'.$file);
@@ -973,16 +985,17 @@ sub recover_timestamps {
 # cannot be determined. $file must already be de-tainted by the caller.
 sub mp4_duration {
   my $file = shift;
+  my $quoted = quotemeta($file);
 
   # Preferred: ask ffprobe for the machine-readable duration in seconds.
-  my $duration = `ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 '$file' 2>/dev/null`;
+  my $duration = `ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 $quoted 2>/dev/null`;
   chomp $duration if defined $duration;
   if ( defined $duration and $duration =~ /^(\d+(?:\.\d+)?)$/ ) {
     return $1;
   }
 
   # Fallback: parse the human-readable "Duration: HH:MM:SS.uu" line.
-  my $output = `ffprobe '$file' 2>&1`;
+  my $output = `ffprobe $quoted 2>&1`;
   if ( $output =~ /Duration:\s*(\d+):(\d+):(\d+)\.(\d+)/ ) {
     return ($1*3600) + ($2*60) + $3 + "0.$4";
   }
@@ -994,10 +1007,10 @@ sub guess_EndDateTime {
   my $event = shift;
   if (!$$event{EndDateTime}) {
     if ($$event{Length}) {
-      my $startdatetime = Date::Parse::str2time( $_[0]{StartDateTime} );
+      my $startdatetime = Date::Parse::str2time( $$event{StartDateTime} );
       $$event{EndDateTime} = Date::Format::time2str('%Y-%m-%d %H:%M:%S', $startdatetime + $$event{Length});
     } else {
-      $$event{EndDateTime} = Date::Format::time2str('%Y-%m-%d %H:%M:%S', Date::Parse::str2time( $_[0]{StartDateTime} )+1);
+      $$event{EndDateTime} = Date::Format::time2str('%Y-%m-%d %H:%M:%S', Date::Parse::str2time( $$event{StartDateTime} )+1);
     }
   }
   return $$event{EndDateTime};
@@ -1092,20 +1105,42 @@ FROM `Frames` WHERE `EventId`=?';
   if (!$frame) {
     return 'Unable to retrieve frame data.';
   }
-  if (!$frame->{EndDateTime}) {
-    return 'Unable to retrieve EndDateTime from Frames Table.';
+  my $start = $self->Time();
+  if (!$start) {
+    return 'Unable to determine the start time of the event.';
   }
-  return $self->save({
-      Name => sprintf('%s%d%s', $self->Monitor()->EventPrefix(), $self->{Id}, $tag),
-      EndDateTime => $frame->{EndDateTime},
-      Length => $frame->{EndTimeStamp} - $self->Time(),
-      Frames => $frame->{Frames},
-      AlarmFrames => $frame->{AlarmFrames},
-      TotScore => $frame->{TotScore},
-      AvgScore => ($frame->{AlarmFrames} ? int($frame->{TotScore} / $frame->{AlarmFrames}) : 0),
-      MaxScore => $frame->{MaxScore},
+
+  # zmc writes Frames rows in batches and updates the event row's Length,
+  # Frames and scores with each batch, so either can be ahead of the other when
+  # zmc dies. An event killed before its first batch has no Frames rows at all.
+  # Take the larger of the two for each.
+  my $end_date_time = $frame->{EndDateTime};
+  my $length = $end_date_time ? $frame->{EndTimeStamp} - $start : 0;
+  if (!$end_date_time or ($self->{Length} // 0) > $length) {
+    $length = $self->{Length} // 0;
+    $end_date_time = time2str('%Y-%m-%d %H:%M:%S', $start + $length);
+  }
+  my $frames = List::Util::max($frame->{Frames} // 0, $self->{Frames} // 0);
+  my $alarm_frames = List::Util::max($frame->{AlarmFrames} // 0, $self->{AlarmFrames} // 0);
+  my $tot_score = List::Util::max($frame->{TotScore} // 0, $self->{TotScore} // 0);
+  my $max_score = List::Util::max($frame->{MaxScore} // 0, $self->{MaxScore} // 0);
+
+  my %changes = (
+      EndDateTime => $end_date_time,
+      Length => $length,
+      Frames => $frames,
+      AlarmFrames => $alarm_frames,
+      TotScore => $tot_score,
+      AvgScore => ($alarm_frames ? int($tot_score / $alarm_frames) : 0),
+      MaxScore => $max_score,
       Notes => $self->Notes() . ' ' . $text,
-    });
+    );
+  # Like zmc's own close (~Event: Name = IF(Name='New Event', ...)), keep a name
+  # the user gave the event; only the placeholder gets the recovered name.
+  if (($self->{Name} // 'New Event') eq 'New Event') {
+    $changes{Name} = sprintf('%s%d%s', $self->Monitor()->EventPrefix(), $self->{Id}, $tag);
+  }
+  return $self->save(\%changes);
 } # end sub Close
 
 sub Event_Tags {

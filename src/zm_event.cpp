@@ -65,6 +65,7 @@ Event::Event(
   tot_score(0),
   max_score(-1),
   max_score_frame_id(0),
+  frame_write_failures(0),
   //path(""),
   //snapshit_file(),
   snapshot_file_written(false),
@@ -141,8 +142,10 @@ Event::Event(
                       now_str.c_str(),
                       monitor->Width(),
                       monitor->Height(),
-                      cause.c_str(),
-                      notes.c_str(),
+                      // Both come from outside the daemon: zone names (Monitors=Edit in the
+                      // web UI) and the external trigger's cause and text. refs GHSA-hc5x-7jfw-r692
+                      zmDbEscapeString(cause).c_str(),
+                      zmDbEscapeString(notes).c_str(),
                       state_id,
                       monitor->getOrientation(),
                       0,
@@ -288,15 +291,15 @@ Event::~Event() {
   }
 
   // endtime is set in AddFrame, so SHOULD be set to the value of the last frame timestamp.
-  if (end_time.time_since_epoch() == Seconds(0)) {
+  if (end_time.load().time_since_epoch() == Seconds(0)) {
     Warning("Empty endtime for event. Should not happen. Setting to now.");
     end_time = std::chrono::system_clock::now();
   }
 
-  FPSeconds delta_time = end_time - start_time;
+  FPSeconds delta_time = end_time.load() - start_time;
   Debug(2, "start_time: %.2f end_time: %.2f",
         std::chrono::duration_cast<FPSeconds>(start_time.time_since_epoch()).count(),
-        std::chrono::duration_cast<FPSeconds>(end_time.time_since_epoch()).count());
+        std::chrono::duration_cast<FPSeconds>(end_time.load().time_since_epoch()).count());
 
   if (frame_data.size()) WriteDbFrames();
 
@@ -331,11 +334,11 @@ Event::~Event() {
       " MaxScoreFrameId=%d, DefaultVideo='%s', DiskSpace=%" PRIu64
       " WHERE Id = %" PRIu64,
       monitor->Substitute(monitor->EventPrefix(), start_time).c_str(), id,
-      static_cast<intmax_t>(std::chrono::system_clock::to_time_t(end_time)),
+      static_cast<intmax_t>(std::chrono::system_clock::to_time_t(end_time.load())),
       delta_time.count(),
-      frames, alarm_frames,
+      frames.load(), alarm_frames.load(),
       tot_score, static_cast<uint32>(alarm_frames ? (tot_score / alarm_frames) : 0),
-      max_score, max_score_frame_id,
+      EventMaxScoreForDb(max_score), max_score_frame_id,
       video_file.c_str(), // defaults to ""
       video_size,
       id);
@@ -352,6 +355,10 @@ Event::~Event() {
   if (storage && storage->Id()) {
     sql = stringtf("UPDATE Storage SET DiskSpace = DiskSpace + %" PRIu64 " WHERE Id=%u", video_size, storage->Id());
     dbQueue.push(std::move(sql));
+  }
+
+  if (frame_write_failures > 1) {
+    Warning("%d frame images could not be written for event %" PRIu64, frame_write_failures, id);
   }
   Debug(1, "~Event %" PRIu64 ": complete", id);
 }  // Event::~Event()
@@ -484,7 +491,7 @@ void Event::AddPacket_(const std::shared_ptr<ZMPacket>packet) {
   }
 #if HAS_NLOHMANN_JSON
   if (packet->detections.size()) {
-    std::string sql = stringtf("INSERT INTO Event_Data (EventId,MonitorId,FrameId,Timestamp,Data) VALUES (%" PRId64 ", %d, %d, NOW(), '%s')", id, monitor->Id(), frames, packet->detections.dump().c_str());
+    std::string sql = stringtf("INSERT INTO Event_Data (EventId,MonitorId,FrameId,Timestamp,Data) VALUES (%" PRId64 ", %d, %d, NOW(), '%s')", id, monitor->Id(), frames.load(), zmDbEscapeString(packet->detections.dump()).c_str());
     dbQueue.push(std::move(sql));
 
     for (auto it = packet->detections.begin(); it != packet->detections.end(); ++it) {
@@ -602,21 +609,27 @@ void Event::AddFrame(const std::shared_ptr<ZMPacket>&packet) {
   if (frame_type == ALARM) alarm_frames++;
 
   Debug(1, "Have frame type %s from score(%d) state %d frames %d bulk frame interval %d and mod%d",
-        frame_type_names[frame_type], score, monitor_state, frames, config.bulk_frame_interval, (frames % config.bulk_frame_interval));
+        frame_type_names[frame_type], score, monitor_state, frames.load(), config.bulk_frame_interval, (frames.load() % config.bulk_frame_interval));
 
   if (score < 0) score = 0;
   tot_score += score;
 
   if (packet->image) {
+    auto note_frame_write_failure = [&](const std::string &message) {
+      if (frame_write_failures == 0)
+        Error("%s", message.c_str());
+      frame_write_failures++;
+    };
+
     if (save_jpegs & 1) {
-      std::string event_file = stringtf(staticConfig.capture_file_format.c_str(), path.c_str(), frames);
-      Debug(1, "Writing capture frame %d to %s", frames, event_file.c_str());
+      std::string event_file = stringtf(staticConfig.capture_file_format.c_str(), path.c_str(), frames.load());
+      Debug(1, "Writing capture frame %d to %s", frames.load(), event_file.c_str());
       if (!WriteFrameImage(packet->image, packet->timestamp, event_file.c_str())) {
-        Error("Failed to write frame image at %s", event_file.c_str());
+        note_frame_write_failure(stringtf("Failed to write frame image at %s", event_file.c_str()));
       }
     }  // end if save_jpegs
 
-    Debug(1, "frames %d, score %d max_score %d", frames, score, max_score);
+    Debug(1, "frames %d, score %d max_score %d", frames.load(), score, max_score);
     // If this is the first frame, we should add a thumbnail to the event directory
     if ((frames == 1) || (score > max_score) || (!snapshot_file_written)) {
       write_to_db = true; // web ui might show this as thumbnail, so db needs to know about it.
@@ -624,7 +637,7 @@ void Event::AddFrame(const std::shared_ptr<ZMPacket>&packet) {
       WriteFrameImage(packet->image, packet->timestamp, snapshot_file.c_str());
       snapshot_file_written = true;
     } else {
-      Debug(1, "Not Writing snapshot because frames %d score %d > max %d", frames, score, max_score);
+      Debug(1, "Not Writing snapshot because frames %d score %d > max %d", frames.load(), score, max_score);
     }
 
     // We are writing an Alarm frame
@@ -635,7 +648,7 @@ void Event::AddFrame(const std::shared_ptr<ZMPacket>&packet) {
         alarm_frame_written = true;
         Debug(1, "Writing alarm image to %s", alarm_file.c_str());
         if (!WriteFrameImage(packet->image, packet->timestamp, alarm_file.c_str())) {
-          Error("Failed to write alarm frame image to %s", alarm_file.c_str());
+          note_frame_write_failure(stringtf("Failed to write alarm frame image to %s", alarm_file.c_str()));
         }
       } else {
         Debug(3, "Not Writing alarm image because alarm frame already written");
@@ -644,10 +657,10 @@ void Event::AddFrame(const std::shared_ptr<ZMPacket>&packet) {
 
     if (save_jpegs & 2) {
       if (packet->analysis_image) {
-        std::string event_file = stringtf(staticConfig.analyse_file_format.c_str(), path.c_str(), frames);
-        Debug(1, "Writing analysis frame %d to %s", frames, event_file.c_str());
+        std::string event_file = stringtf(staticConfig.analyse_file_format.c_str(), path.c_str(), frames.load());
+        Debug(1, "Writing analysis frame %d to %s", frames.load(), event_file.c_str());
         if (!WriteFrameImage(packet->analysis_image, packet->timestamp, event_file.c_str(), true)) {
-          Error("Failed to write analysis frame image to %s", event_file.c_str());
+          note_frame_write_failure(stringtf("Failed to write analysis frame image to %s", event_file.c_str()));
         }
       } else {
         Debug(1, "Wanted to save analysis frame, but packet has no analysis_image");
@@ -702,8 +715,8 @@ void Event::AddFrame(const std::shared_ptr<ZMPacket>&packet) {
       std::string sql = stringtf(
                           "UPDATE Events SET Length=%.2f, Frames=%d, AlarmFrames=%d, TotScore=%d, AvgScore=%d, MaxScore=%d, MaxScoreFrameId=%d WHERE Id=%" PRIu64,
                           FPSeconds(delta_time).count(),
-                          frames,
-                          alarm_frames,
+                          frames.load(),
+                          alarm_frames.load(),
                           tot_score,
                           static_cast<uint32>(alarm_frames ? (tot_score / alarm_frames) : 0),
                           max_score,
@@ -860,7 +873,6 @@ void Event::Run() {
       monitor->GetVideoStream(),
       monitor->GetVideoCodecContext(),
       ( monitor->RecordAudio() ? monitor->GetAudioStream() : nullptr ),
-      ( monitor->RecordAudio() ? monitor->GetAudioCodecContext() : nullptr ),
       monitor );
 
     if (!videoStore->open()) {
@@ -890,7 +902,7 @@ void Event::Run() {
       }
       // Surface the (codec-bearing if rename succeeded) name to consumers before close
       zmDbDo(stringtf("UPDATE Events SET DefaultVideo='%s' WHERE Id=%" PRIu64,
-                      video_incomplete_file.c_str(), id));
+                      zmDbEscapeString(video_incomplete_file).c_str(), id));
     }
   }  // end if GetOptVideoWriter
 

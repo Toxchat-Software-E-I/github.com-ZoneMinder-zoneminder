@@ -122,7 +122,7 @@ class Zone {
     int p_overload_frames,
     int p_extend_alarm_frames);
 
-  void std_alarmedpixels(const Image* pdelta_image, Image* pmask_image, const Image* ppoly_image, unsigned int* pixel_count, unsigned int* pixel_sum);
+  void std_alarmedpixels(const Image* pdelta_image, Image* pmask_image, const Image* ppoly_image, unsigned int* pixel_count, unsigned int* pixel_sum, Box* alarmed_box);
 
  public:
   Zone(
@@ -212,7 +212,10 @@ class Zone {
 
   static bool ParsePolygonString( const char *polygon_string, Polygon &polygon );
   static bool ParsePercentagePolygon(const char *poly_string, unsigned int width, unsigned int height, Polygon &polygon);
+  static bool ClampPolygon(Polygon &polygon, unsigned int width, unsigned int height);
   static bool ParseZoneString( const char *zone_string, unsigned int &zone_id, int &colour, Polygon &polygon );
+  static bool ParseCoords(const char *Coords, unsigned int width, unsigned int height, Polygon &polygon, bool &clamped);
+  static size_t Count(const std::shared_ptr<Monitor> &monitor);
   static std::vector<Zone> Load(const std::shared_ptr<Monitor> &monitor);
   //=================================================
   bool CheckOverloadCount();

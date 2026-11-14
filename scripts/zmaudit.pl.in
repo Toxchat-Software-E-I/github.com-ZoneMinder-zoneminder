@@ -149,6 +149,7 @@ my $image_path = EVENT_PATH;
 my $loop = 1;
 my $cleaned = 0;
 MAIN: while( $loop ) {
+  ZoneMinder::Object::init_cache();
 
   if ( $continuous ) {
     # if we are running continuously, then just skip to the next
@@ -437,7 +438,6 @@ MAIN: while( $loop ) {
           $Event->Path();
           $Event->age();
           Debug("Have event $$Event{Id} at $$Event{Path}");
-          $Event->StartDateTime(POSIX::strftime('%Y-%m-%d %H:%M:%S', gmtime(time_of_youngest_file($Event->Path()))));
         } # end foreach event
       } # end scope for medium
 
@@ -526,8 +526,15 @@ MAIN: while( $loop ) {
       aud_print("Filesystem monitor link '$link' does not point to valid monitor directory");
       if ( confirm() ) {
         ( $link ) = ( $link =~ /^(.*)$/ ); # De-taint
-        executeShellCommand($Config{ZM_PATH_RM}.qq` "$link"`);
-        $cleaned = 1;
+        # unlink(), not a shell rm: the link name is the monitor name, which a
+        # user with Monitors create/edit controls and which is not shell-escaped
+        # here, so rm "$link" would expand $(...) or backticks embedded in it
+        # (refs GHSA-746p-4622-p3fr). unlink removes the symlink itself, no shell.
+        if ( unlink($link) ) {
+          $cleaned = 1;
+        } else {
+          Error("Unable to remove monitor link '$link': $!");
+        }
       }
     } # end foreach monitor link
   } # end foreach Storage Area
@@ -562,10 +569,19 @@ MAIN: while( $loop ) {
     # If we found the monitor in the file system
     my $fs_events = $fs_monitors->{$db_monitor};
 
-EVENT: while ( my ( $db_event, $age ) = each( %$db_events ) ) {
+    my @db_event_ids = sort { $a <=> $b } keys %$db_events;
+    my $db_rows;
+EVENT: foreach my $i ( 0 .. $#db_event_ids ) {
+      my $db_event = $db_event_ids[$i];
+      my $age = $$db_events{$db_event};
+      if ( $i % 1000 == 0 ) {
+        my @batch = @db_event_ids[$i .. ($i+999 < $#db_event_ids ? $i+999 : $#db_event_ids)];
+        $db_rows = $dbh->selectall_hashref('SELECT * FROM `Events` WHERE `Id` IN ('.join(',', ('?') x @batch).')', 'Id', undef, @batch)
+          or Fatal("Can't load events: ".$dbh->errstr());
+      }
       if ( ! ($fs_events and defined( $fs_events->{$db_event} ) ) ) {
         Debug("Don't have an fs event for $db_event");
-        my $Event = ZoneMinder::Event->find_one( Id=>$db_event );
+        my $Event = ($$db_rows{$db_event} ? ZoneMinder::Event->new($db_event, $$db_rows{$db_event}) : undef);
         if ( ! $Event ) {
           Debug("Event $db_event is no longer in db.  Filter probably deleted it while we were auditing.");
           next;
@@ -623,7 +639,7 @@ EVENT: while ( my ( $db_event, $age ) = each( %$db_events ) ) {
         } # end if exists in filesystem
       } else {
         Debug("Found fs event for id $db_event, $age seconds old at " . $$fs_events{$db_event}->Path());
-        my $Event = ZoneMinder::Event->find_one( Id=>$db_event );
+        my $Event = ($$db_rows{$db_event} ? ZoneMinder::Event->new($db_event, $$db_rows{$db_event}) : undef);
         if ( $Event and ! $Event->check_for_in_filesystem() ) {
           Warning('Not found at ' . $Event->Path() . ' was found at ' . $$fs_events{$db_event}->Path());
           Warning($Event->to_string());
@@ -638,8 +654,12 @@ EVENT: while ( my ( $db_event, $age ) = each( %$db_events ) ) {
             $Event->StorageId($$fs_events{$db_event}->StorageId());
           }
           if ( ! $Event->StartDateTime() ) {
-            Info("Updating StartDateTime on event $$Event{Id} from $$Event{StartDateTime} to $$fs_events{$db_event}{StartDateTime}");
-            $Event->StartDateTime($$fs_events{$db_event}->StartDateTime());
+            my $StartDateTime = $$fs_events{$db_event}->StartDateTime();
+            if ( ! $StartDateTime ) {
+              $StartDateTime = POSIX::strftime('%Y-%m-%d %H:%M:%S', localtime(time_of_youngest_file($$fs_events{$db_event}->Path())));
+            }
+            Info("Updating StartDateTime on event $$Event{Id} from $$Event{StartDateTime} to $StartDateTime");
+            $Event->StartDateTime($StartDateTime);
           }
 
           $Event->save();
@@ -681,7 +701,7 @@ if ( $level > 1 ) {
 # Remove empty events (with no frames)
   $cleaned = 0;
   Debug("Checking for Events with no Frames");
-  my $selectEmptyEventsSql = 'SELECT `E`.`Id` AS `Id`, `E`.`StartDateTime`, `F`.`EventId` FROM `Events` AS E LEFT JOIN `Frames` AS F ON (`E`.`Id` = `F`.`EventId`)
+  my $selectEmptyEventsSql = 'SELECT `E`.`Id` AS `Id`, `E`.`StartDateTime`, `E`.`Archived`, `F`.`EventId` FROM `Events` AS E LEFT JOIN `Frames` AS F ON (`E`.`Id` = `F`.`EventId`)
     WHERE isnull(`F`.`EventId`) AND now() - interval '.$Config{ZM_AUDIT_MIN_AGE}.' second > `E`.`StartDateTime`';
   if ( my $selectEmptyEventsSth = $dbh->prepare_cached( $selectEmptyEventsSql ) ) {
     if ( $res = $selectEmptyEventsSth->execute() ) {
@@ -1303,12 +1323,13 @@ sub time_of_youngest_file {
   Debug("stat of dir $dir is $youngest");
   foreach my $file ( readdir( DIR ) ) {
     next if $file =~ /^\./;
-    $_ = (stat($dir))[9];
+    $_ = (stat("$dir/$file"))[9];
     if ($_ and ($_ < $youngest)) {
       $youngest = $_;
       Debug("Found younger file $file at $youngest");
     }
   }
+  closedir(DIR);
   return $youngest;
 } # end sub time_of_youngest_file
 

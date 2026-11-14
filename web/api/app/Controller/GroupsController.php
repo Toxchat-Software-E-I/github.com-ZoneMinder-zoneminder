@@ -57,7 +57,9 @@ class GroupsController extends AppController {
 
     if ( $this->request->params['named'] ) {
       $this->FilterComponent = $this->Components->load('Filter');
-      $conditions = $this->FilterComponent->buildFilter($this->request->params['named']);
+      // Groups_Monitors is joined below and has an Id column too, so write Group.Id.
+      $named = $this->FilterComponent->qualifyFields($this->request->params['named'], array('Group' => array_keys($this->Group->schema())));
+      $conditions = $this->FilterComponent->buildFilter($named, array_keys($this->Group->schema()));
     } else {
       $conditions = array();
     }
@@ -121,15 +123,15 @@ class GroupsController extends AppController {
         return;
       }
 
-      $monitorIds = $this->requestAssociatedIds('Group', 'MonitorIds', 'Monitor');
-      if ($monitorIds) $this->requireMembershipEdit($monitorIds);
-      $this->pinRequestId($this->Group, null);
-			$this->Group->create();
-
       if ( $this->request->data['Group']['MonitorIds'] and ! isset($this->request->data['Monitor']) ) {
         $this->request->data['Monitor'] = explode(',', $this->request->data['Group']['MonitorIds']);
         unset($this->request->data['Group']['MonitorIds']);
       }
+      $monitorIds = $this->requestAssociatedIds('Group', 'Monitor');
+      if ($monitorIds) $this->requireMembershipEdit($monitorIds);
+      $this->pinRequestId($this->Group, null);
+			$this->Group->create();
+
       if ( $this->Group->saveAssociated($this->request->data, array('atomic'=>true)) ) {
         return $this->flash(
           __('The group has been saved.'),
@@ -137,7 +139,11 @@ class GroupsController extends AppController {
         );
       } else {
         ZM\Error("Failed to save Group");
-        debug($this->Group->invalidFields());
+        $this->set(array(
+          'message' => $this->Group->validationErrors ? $this->Group->validationErrors : 'Error',
+          '_serialize' => array('message')
+        ));
+        return;
       }
     } # end if post
     $monitors = $this->Group->Monitor->find('list');
@@ -155,6 +161,7 @@ class GroupsController extends AppController {
 		if ( !$this->Group->exists($id) ) {
 			throw new NotFoundException(__('Invalid group'));
 		}
+    $message = '';
 		if ( $this->request->is(array('post', 'put'))) {
       global $user;
       # We already tested for auth in appController,
@@ -167,12 +174,19 @@ class GroupsController extends AppController {
       $this->pinRequestId($this->Group, $id);
       $group = new ZM\Group($id);
       $moved = array();
-      $newIds = $this->requestAssociatedIds('Group', 'MonitorIds', 'Monitor');
+      $newIds = $this->requestAssociatedIds('Group', 'Monitor');
       if ($newIds !== null) {
         $oldIds = dbFetchAll('SELECT `MonitorId` FROM `Groups_Monitors` WHERE `GroupId`=?', 'MonitorId', array($id));
         $moved = array_merge(array_diff($oldIds, $newIds), array_diff($newIds, $oldIds));
       }
       $parentId = $this->requestField('Group', 'ParentId');
+      # A parent loop makes the group code recurse forever.
+      for ($ancestor = (is_scalar($parentId) ? $parentId : null), $seen = array(); $ancestor and !isset($seen[$ancestor]); $ancestor = $this->Group->field('ParentId', array('Group.Id' => $ancestor))) {
+        if ($ancestor == $id) {
+          throw new BadRequestException(__('A group cannot be placed under itself or one of its own groups'));
+        }
+        $seen[$ancestor] = true;
+      }
       # Re-parenting moves every monitor of this group and its children between ancestors.
       if (($parentId !== null) and ($parentId != $group->ParentId())) {
         $moved = array_merge($moved, $group->MonitorIds());
@@ -183,8 +197,8 @@ class GroupsController extends AppController {
       } else {
         $message = 'Error';
         // if there is a validation message, use it
-        if ( !$this->group->validates() ) {
-          $message .= ': '.$this->Group->validationErrors;
+        if ( !$this->Group->validates() ) {
+          $message = $this->Group->validationErrors;
         }
 			}
 		} # end if post/put
@@ -193,7 +207,7 @@ class GroupsController extends AppController {
 		$this->set(array(
 			'message' => $message,
 			'group' => $group,
-			'_serialize' => array('group')
+			'_serialize' => array('message', 'group')
 		));
 	}
 

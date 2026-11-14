@@ -32,6 +32,9 @@ var timeOutExtruderChange;
 
 const showExtruderPanelOnMouseHover = false;
 const NAVBAR_RELOAD = document.getElementById('reload'); // Top panel with statistics
+// Set by a view that reloads itself in place of navigating (the event view moving to the next
+// event), so the page-leave roll-up in addListenerGlobalBeforeunload() is skipped.
+var skipPageLeaveAnimation = false;
 const BTN_COLLAPSE = document.getElementById('btn-collapse'); // Button to switch the menu view collapsed/expanded
 const SIDEBAR_MAIN = document.getElementById('sidebarMain'); // Left Sidebar with Menu
 const SIDEBAR_MAIN_EXTRUDER = document.getElementById('extruderLeft'); // Sliding extruder panel from the left Sidebar
@@ -627,11 +630,33 @@ function secs2dbstr(s) {
   return dt.toFormat('yyyy-MM-dd HH:mm:ss');
 }
 
+// Resubmit contentForm without saving, so the view re-renders for a value that
+// changes which fields it should show. The monitor view's Method select is the
+// only thing that uses it.
+//
+// The tab to come back on travels in contentForm's hidden "tab" field, which
+// is what the view reads out of $_REQUEST. This used to do
+// form.attr('tab', tab), which set an attribute named "tab" on the <form>
+// element and had no effect whatever: an attribute on a form is not a
+// submitted value.
+//
+// It is not written here at all now, rather than written correctly, because
+// the value it was being given is the wrong one. data-tab-name holds the tab
+// the page loaded on, while the hidden field holds the tab that is on screen:
+// the view writes it, and on the monitor view the pill handler keeps it in
+// step as tabs are clicked. Assigning the attribute's value would have undone
+// that tracking and sent anyone who had switched tabs back to the one they
+// arrived on -- the bug this looks like it would fix.
+//
+// It went unnoticed for the same reason it was harmless: until something
+// tracked tab changes, the two always agreed.
+//
+// $j(...).submit() rather than the element's own submit(), so contentForm's
+// submit handler still runs -- it validates the form and blanks the password
+// fields, and a native submit skips both.
 function submitTab(evt) {
-  var tab = this.getAttribute("data-tab-name");
   var form = $j('#contentForm');
   form.attr('action', '');
-  form.attr('tab', tab);
   form.submit();
   evt.preventDefault();
 }
@@ -1182,7 +1207,7 @@ function getModal(id, parameters, buttonconfig=null) {
           return;
         }
 
-        insertModalHtml(id, data.html);
+        insertModalHtml(id + 'Modal', data.html);
         buttonconfig ? buttonconfig() : manageModalBtns(id);
         var modal = $j('#'+id+'Modal');
         if ( ! modal.length ) {
@@ -1556,12 +1581,25 @@ function formatDateTime(date) {
   return date.toLocaleString(undefined, options);
 }
 
+// The go2rtc API base for a ZM_GO2RTC_PATH, as a URL. go2rtc serves its API, and
+// the /ws websocket under it, at /api, but the natural thing to enter is the server
+// address, so "http://host:1984" and "http://host:1984/api" both work.
+function go2rtcApiUrl(path) {
+  const url = new URL(path);
+  // Build the path in one go: a URL's pathname is never empty, so stripping the
+  // slash from "/" and appending to it would give "//api".
+  let pathname = url.pathname.replace(/\/+$/, '');
+  if (!pathname.endsWith('/api')) pathname += '/api';
+  url.pathname = pathname;
+  return url;
+}
+
 function createGo2rtcStream(container, img, src, mid, fallbackToMjpeg) {
   ensureVideoStreamLoaded().then(function() {
     if (!document.getElementById('thumb-overlay')) return;
 
     const channel = (img.dataset.streamChannel && img.dataset.streamChannel.toLowerCase().indexOf("direct") !== -1 ) ? img.dataset.streamChannel : 'CameraDirectPrimary';
-    const url = new URL(src);
+    const url = go2rtcApiUrl(src);
     url.protocol = (url.protocol === 'https:') ? 'wss:' : 'ws:';
     url.pathname += '/ws';
     //url.search = 'src=' + mid + '_0';
@@ -2978,8 +3016,16 @@ function initPageGeneral() {
     });
   }
 
+  // The stats panel can wrap to another line, which moves everything below the navbar, so
+  // rescale then. Only a change of height matters: a ResizeObserver also reports the size it
+  // starts with, and the figures change width on every refresh, and rescaling for either
+  // resized the video on the event and watch views for nothing.
+  // The left navbar can be collapsed and expanded, which will change the space available for displaying the stream.
+  let navbarReloadHeight = null;
   var observerNavbarReload = new window.ResizeObserver((entries) => {
-    endOfResize();
+    const height = entries[entries.length - 1].contentRect.height;
+    if ((navbarReloadHeight !== null && height != navbarReloadHeight) || navbar_type == 'left') endOfResize();
+    navbarReloadHeight = height;
   });
   if (NAVBAR_RELOAD) {
     observerNavbarReload.observe(NAVBAR_RELOAD);
@@ -3052,7 +3098,7 @@ function initPageGeneral() {
       return;
     }
 
-    if (mainContent) {
+    if (mainContent && !skipPageLeaveAnimation) {
       if (mainContentJ.css('display') == 'flex') {
         // If flex-grow is set to a value > 0 then "height" will be ignored!
         mainContentJ.css({flex: "0 1 auto"});

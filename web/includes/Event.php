@@ -208,30 +208,49 @@ class Event extends ZM_Object {
       Error('Cannot delete an Archived event.');
       return;
     }
-    if ( ZM_OPT_FAST_DELETE ) {
-      dbQuery('DELETE FROM Events WHERE Id = ?', array($this->{'Id'}));
-      return;
-    }
-
     $dbConn = zmDbConn();
     $dbConn->beginTransaction();
     try {
       $this->lock();
-      dbQuery('DELETE FROM Stats WHERE EventId = ?', array($this->{'Id'}));
-      dbQuery('DELETE FROM Frames WHERE EventId = ?', array($this->{'Id'}));
+      # lock() reloaded the row, so this sees an archive made after the event was loaded
+      if ( $this->{'Archived'} ) {
+        Error('Cannot delete an Archived event.');
+        $dbConn->rollback();
+        return;
+      }
+      # dbQuery() reports a failed statement by returning null, not by throwing
+      foreach (array('Stats', 'Event_Data', 'Frames') as $table) {
+        if (null === dbQuery('DELETE FROM '.$table.' WHERE EventId = ?', array($this->{'Id'}))) {
+          throw new \Exception('Unable to delete '.$table.' rows of event '.$this->{'Id'}.' not deleting.');
+        }
+      }
+      if (null === dbQuery('DELETE FROM Events WHERE Id = ?', array($this->{'Id'}))) {
+        throw new \Exception('Unable to delete event '.$this->{'Id'}.' not deleting files.');
+      }
+      $dbConn->commit();
+    } catch (\Exception $e) {
+      Error($e->getMessage());
+      $dbConn->rollback();
+      return;
+    }
+    if (!empty($this->{'DiskSpace'}) and !empty($this->{'StorageId'})) {
+      dbQuery('UPDATE Storage SET DiskSpace=GREATEST(COALESCE(DiskSpace,0)-?,0) WHERE Id=?', array($this->{'DiskSpace'}, $this->{'StorageId'}));
+    }
+    # The rows are gone, so a failure below leaves files for zmaudit to remove
+    try {
       if ( $this->{'Scheme'} == 'Deep' ) {
 
         # Assumption: All events have a start time
         $start_date = date_parse($this->{'StartDateTime'});
         if ( ! $start_date ) {
-          throw new Exception('Unable to parse start date time for event ' . $this->{'Id'} . ' not deleting files.');
+          throw new \Exception('Unable to parse start date time for event ' . $this->{'Id'} . ' not deleting files.');
         }
         $start_date['year'] = $start_date['year'] % 100;
 
         # So this is because ZM creates a link under the day pointing to the time that the event happened. 
         $link_path = $this->Link_Path();
         if ( ! $link_path ) {
-          throw new Exception('Unable to determine link path for event '.$this->{'Id'}.' not deleting files.');
+          throw new \Exception('Unable to determine link path for event '.$this->{'Id'}.' not deleting files.');
         }
 
         $Storage = $this->Storage();
@@ -239,14 +258,16 @@ class Event extends ZM_Object {
 
         if ( $id_files = glob($eventlink_path) ) {
           if ( ! $eventPath = readlink($id_files[0]) ) {
-            throw new Exception("Unable to read link at $id_files[0]");
+            throw new \Exception("Unable to read link at $id_files[0]");
           }
           # I know we are using arrays here, but really there can only ever be 1 in the array
           $eventPath = preg_replace('/\.'.$this->{'Id'}.'$/', $eventPath, $id_files[0]);
           deletePath($eventPath);
           deletePath($id_files[0]);
           $pathParts = explode('/', $eventPath);
-          for ( $i = count($pathParts)-1; $i >= 2; $i-- ) {
+          # Stop at the monitor directory, never remove the storage area itself
+          $keepParts = count(explode('/', rtrim($Storage->Path(), '/'))) + 1;
+          for ( $i = count($pathParts)-1; $i > $keepParts; $i-- ) {
             $deletePath = join('/', array_slice($pathParts, 0, $i));
             if ( !glob($deletePath.'/*') ) {
               deletePath($deletePath);
@@ -258,9 +279,11 @@ class Event extends ZM_Object {
       } else {
         $eventPath = $this->Path();
         if ( ! $eventPath ) {
-          throw new Exception('No event Path in Event delete. Not deleting');
+          throw new \Exception('No event Path in Event delete. Not deleting');
         }
         deletePath($eventPath);
+        # rmdir() leaves the date directory alone while other events are in it
+        if ( $this->{'Scheme'} == 'Medium' ) @rmdir(dirname($eventPath));
         if ( $this->SecondaryStorageId() ) {
           $Storage = $this->SecondaryStorage();
           if ( $Storage->Id() ) {
@@ -269,17 +292,13 @@ class Event extends ZM_Object {
               Error('No event Path in Event delete. Not deleting');
             } else {
               deletePath($eventPath);
+              if ( $this->{'Scheme'} == 'Medium' ) @rmdir(dirname($eventPath));
             }
           } # end if Storage
         } # end if has Secondary Storage
       } # USE_DEEP_STORAGE OR NOT
-      dbQuery('DELETE FROM Events WHERE Id = ?', array($this->{'Id'}));
-      $dbConn->commit();
-    } catch (PDOException $e) {
-      $dbConn->rollback();
-    } catch (Exception $e) {
+    } catch (\Exception $e) {
       Error($e->getMessage());
-      $dbConn->rollback();
     }
   } # end Event->delete
 
@@ -618,7 +637,7 @@ class Event extends ZM_Object {
           return;
         }
       }
-      Debug("sending command to $url");
+      Debug('sending command to '.urlForLog($url));
       // use key 'http' even if you send the request to https://...
       $options = array(
           'http' => array(
@@ -629,9 +648,9 @@ class Event extends ZM_Object {
           );
       $context  = stream_context_create($options);
       try {
-        $result = file_get_contents($url, false, $context);
+        $result = @file_get_contents($url, false, $context);
         if ($result === FALSE) { /* Handle error */
-          Error("Error restarting zmc using $url");
+          Error('Error restarting zmc using '.urlForLog($url).': '.lastErrorForLog());
         }
         $event_data = json_decode($result,true);
         Debug(print_r($event_data['event']['Event'],1));
@@ -666,7 +685,7 @@ class Event extends ZM_Object {
           return;
         }
       }
-      Debug("sending command to $url");
+      Debug('sending command to '.urlForLog($url));
       // use key 'http' even if you send the request to https://...
       $options = array(
           'http' => array(
@@ -677,9 +696,9 @@ class Event extends ZM_Object {
           );
       $context = stream_context_create($options);
       try {
-        $result = file_get_contents($url, false, $context);
+        $result = @file_get_contents($url, false, $context);
         if ( $result === FALSE ) { /* Handle error */
-          Error("Error restarting zmc using $url");
+          Error('Error restarting zmc using '.urlForLog($url).': '.lastErrorForLog());
         }
         $event_data = json_decode($result,true);
         Debug(print_r($event_data['event']['Event'], 1));
@@ -723,14 +742,19 @@ class Event extends ZM_Object {
       # auth turned on and not logged in
       return false;
     }
+    # An Event with no Id (an empty or failed lookup) has no monitor, and an
+    # empty Monitor passes canView() on the global Monitors permission. Refuse
+    # it, so a caller that skips its own Id() check does not fail open.
+    if (!$this->Id()) return false;
     if (!$this->Monitor()->canView($u)) return false;
 
-    if ($u->Events() != 'None') {
+    # canView() counts the user's role as well as their own field. refs #5189
+    if ($u->canView('Events')) {
       return true;
     }
-    if ($u->Snapshots() != 'None') {
+    if ($u->canView('Snapshots')) {
       # If the event is contained in a snapshot, then we can still view it.
-      if (dbFetchOne('SELECT * FROM Snapshot_Events WHERE EventId=?', $this->Id()))
+      if (dbFetchOne('SELECT * FROM Snapshots_Events WHERE EventId=?', false, array($this->Id())))
         return true;
     }
     return false;
@@ -743,8 +767,9 @@ class Event extends ZM_Object {
       # auth turned on and not logged in
       return false;
     }
+    if (!$this->Id()) return false;
     if (!$this->Monitor()->canView($u)) return false;
-    if ($u->Events() != 'Edit') {
+    if (!$u->canEdit('Events')) {
       return false;
     }
     return true;
@@ -791,11 +816,13 @@ class Event extends ZM_Object {
     } else if ($previousBulkFrame) {
       //If no next Frame we have to pull data from the Event itself
       $frame = new Frame($previousBulkFrame);
-      $frame->FrameId($_REQUEST['fid']);
+      $frame->FrameId($fid);
 
-      $percentage = ($frame->FrameId()/$this->Frames());
-
-      $frame->Delta(floor($this->Length() * $percentage));
+      $previousFrameId = $previousBulkFrame['FrameId'];
+      $previousDelta = $previousBulkFrame['Delta'];
+      if ($this->Frames() > $previousFrameId and $this->Length() > $previousDelta) {
+        $frame->Delta(round($previousDelta + ($this->Length() - $previousDelta) * ($fid - $previousFrameId) / ($this->Frames() - $previousFrameId), 2));
+      }
     }
     return $frame;
   }
@@ -848,7 +875,7 @@ class Event extends ZM_Object {
     if ( $overwrite || ! file_exists($video_file) ) {
       Info("Creating video file $video_file for event ".$this->Id());
 
-      $frame_rate = sprintf('%.2f', $this->Frames()/$this->Length());
+      $frame_rate = $this->Length() > 0 ? sprintf('%.2f', $this->Frames()/$this->Length()) : 1;
       if ($rate) {
         if ( $rate != 1.0 ) {
           $frame_rate *= $rate;

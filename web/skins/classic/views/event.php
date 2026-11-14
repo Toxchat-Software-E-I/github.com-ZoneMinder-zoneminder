@@ -68,6 +68,15 @@ if (isset($_REQUEST['scale'])) {
 //}
 $scale = '10'; // temporarily to adapt the new algorithm, not used in new calculations!
 
+# The size changeScale() last gave this monitor's video. Opening the page at it keeps the video
+# from resizing after load, which in gapless playback (a page load per event) happened on every
+# event. changeScale() still corrects it if the window or the layout has changed.
+$videoSizeStyle = '';
+$videoSizeCookie = 'zmEventVideoSize'.$Event->MonitorId();
+if (isset($_COOKIE[$videoSizeCookie]) and preg_match('/^(\d{1,5})x(\d{1,5})$/', $_COOKIE[$videoSizeCookie], $videoSize)) {
+  $videoSizeStyle = ' style="width:'.intval($videoSize[1]).'px;height:'.intval($videoSize[2]).'px;"';
+}
+
 $streamQualitySelected = '0';
 if (isset($_REQUEST['streamQuality'])) {
   $streamQualitySelected = $_REQUEST['streamQuality'];
@@ -277,14 +286,20 @@ if ( $Event->Id() and !file_exists($Event->Path()) )
       <div class="d-flex flex-row px-3">
         <div class="container-fluid">
           <div class="row row-cols-1 row-cols-sm-2">
-            <div id = "eventStats" class="col col-sm-3 eventStats">
+<?php
+# Lay the stats out the way showEventStats() would, so the video's column has its final width at
+# the first paint instead of changing after load. The details show unless the cookie says off,
+# matching getEvtStatsCookie(); the column itself stays for the tags input.
+$showEventStats = !(isset($_COOKIE['zmEventStats']) and $_COOKIE['zmEventStats'] == 'off');
+?>
+            <div id = "eventStats" class="col <?php echo $showEventStats ? 'col-sm-3' : 'col-sm-12' ?> eventStats">
               <div class="tags-container">
                 <div class="tag-dropdown">
                   <!-- input type has to be "search" (not "text") so that the Enter button (not Next) works on mobile Chrome browser. -->
-                  <input type="search" id="tagInput" class="tag-input" placeholder="Add tag" data-role="tagsinput">
+                  <input type="search" id="tagInput" class="tag-input" placeholder="Add tag" data-role="tagsinput"<?php echo canEdit('Events') ? '' : ' disabled="disabled"' ?>>
                   <div class="tag-dropdown-content"></div>
                 </div>
-                <button type="button" id="tagPrevBtn" title="<?php echo translate('Apply the last tag, then play the previous event') ?>" class="inactive" data-on-click-true="tagAndPrev">
+                <button type="button" id="tagPrevBtn"<?php echo canEdit('Events') ? '' : ' disabled="disabled"' ?> title="<?php echo translate('Apply the last tag, then play the previous event') ?>" class="inactive" data-on-click-true="tagAndPrev">
                   <i class="material-icons md-18"
                     style="-moz-transform: scaleX(-1);
                       -o-transform: scaleX(-1);
@@ -294,11 +309,11 @@ if ( $Event->Id() and !file_exists($Event->Path()) )
                       -ms-filter: 'FlipH';">
                       label</i>
                 </button>
-                <button type="button" id="tagNextBtn" title="<?php echo translate('Apply the last tag, then play the next event') ?>" class="inactive" data-on-click-true="tagAndNext">
+                <button type="button" id="tagNextBtn"<?php echo canEdit('Events') ? '' : ' disabled="disabled"' ?> title="<?php echo translate('Apply the last tag, then play the next event') ?>" class="inactive" data-on-click-true="tagAndNext">
                   <i class="material-icons md-18">label</i>
                 </button>
               </div><!--tags-container-->
-              <div id="eventStatsDetails">
+              <div id="eventStatsDetails"<?php echo $showEventStats ? '' : ' style="display:none;"' ?>>
               <!-- VIDEO STATISTICS TABLE -->
               <table id="eventStatsTable" class="table-sm table-borderless">
                 <!-- EVENT STATISTICS POPULATED BY JAVASCRIPT -->
@@ -338,7 +353,7 @@ if (file_exists($Event->Path().'/objdetect.jpg')) {
               </div><!-- id="frames" -->
               </div><!-- id="eventStatsDetails" -->
             </div><!-- id="eventStats" -->
-            <div id="wrapperEventVideo" class="col col-sm-9 pl-0 pr-0">
+            <div id="wrapperEventVideo" class="col <?php echo $showEventStats ? 'col-sm-9' : 'col-sm-12' ?> pl-0 pr-0">
               <div id="eventVideo">
               <!-- VIDEO CONTENT -->
                 <div id="videoFeed">
@@ -375,7 +390,7 @@ if ($video_tag) {
     }
   }
 ?>
-                  <video id="videoobj" class="video-js"
+                  <video id="videoobj" class="video-js"<?php echo $videoSizeStyle ?>
                    <?php echo $scale ? 'width="'.reScale($Event->Width(), $scale).'"' : '' ?>
                    <?php echo $scale ? 'height="'.reScale($Event->Height(), $scale).'"' : '' ?>
                     controls autoplay preload="auto"
@@ -482,7 +497,7 @@ if ($video_tag) {
                 </div><!--videoFeed-->
 <?php
 if (defined('AUDIO_MOTION_ENABLED') && AUDIO_MOTION_ENABLED) echo '
-                <audio-motion id="audioVisualization'.$monitor->Id().'" class="audio-visualization">
+                <audio-motion id="audioVisualization'.$monitor->Id().'" class="audio-visualization hidden">
                   <div id="audioControlPanel'.$monitor->Id().'" class="audio-control-panel">
                     <div id="volumeControls'.$monitor->Id().'" class="disabled volume">
                       <div id="volumeSlider'.$monitor->Id().'" data-volume="50" data-muted="true" class="volumeSlider noUi-horizontal noUi-base noUi-round"></div>
@@ -573,6 +588,7 @@ if (defined('AUDIO_MOTION_ENABLED') && AUDIO_MOTION_ENABLED) echo '
   <link href="skins/<?php echo $skin ?>/js/video-js.css" rel="stylesheet">
   <script src="skins/<?php echo $skin ?>/js/video.min.js"></script>
   <script src="./js/videojs.zoomrotate.js"></script>
+  <script src="<?php echo cache_bust('skins/classic/views/js/event-zms-hints.js') ?>"></script>
 <?php
   echo output_link_if_exists(array('css/base/zones.css'));
   echo output_script_if_exists(array('js/leaflet/leaflet.js'), false);

@@ -25,6 +25,7 @@
 #include "zm_mp4_sidx.h"
 #include "zm_signal.h"
 #include "zm_time.h"
+#include "zm_utils.h"
 
 extern "C" {
 #include <libavutil/time.h>
@@ -34,6 +35,7 @@ extern "C" {
 #include <fcntl.h>
 #include <string>
 #include <unistd.h>
+#include <sys/stat.h>
 
 VideoStore::VideoStore(
   const char *filename_in,
@@ -41,7 +43,6 @@ VideoStore::VideoStore(
   AVStream *p_video_in_stream,
   AVCodecContext *p_video_in_ctx,
   AVStream *p_audio_in_stream,
-  AVCodecContext *p_audio_in_ctx,
   Monitor *p_monitor
 ) :
   chosen_codec_data(nullptr),
@@ -55,11 +56,14 @@ VideoStore::VideoStore(
   video_in_stream(p_video_in_stream),
   audio_in_stream(p_audio_in_stream),
   audio_in_codec(nullptr),
+  // Opened in open() from audio_in_stream's codecpar, not handed in. The
+  // caller used to pass a context as well and this ignored it.
   audio_in_ctx(nullptr),
   audio_out_codec(nullptr),
   audio_out_ctx(nullptr),
   packets_written(0),
   frame_count(0),
+  packet_write_failures(0),
   video_encoded(false),
   video_passthrough_fallback(false),
   hw_device_ctx(nullptr),
@@ -83,7 +87,11 @@ VideoStore::VideoStore(
   init_segment_end_(0),
   sidx_region_offset_(-1),
   sidx_region_size_(0),
-  finalized_(false) {
+  finalized_(false),
+  m3u8_fragments_written_(0),
+  m3u8_target_duration_(0),
+  m3u8_init_segment_end_(-1),
+  m3u8_bytes_written_(0) {
   FFMPEGInit();
   swscale.init();
   opkt = av_packet_ptr{av_packet_alloc()};
@@ -167,6 +175,7 @@ bool VideoStore::open() {
         return false;
       }
       avcodec_parameters_copy(video_out_stream->codecpar, video_in_stream->codecpar);
+      zm_clear_incompatible_codec_tag(oc->oformat, video_out_stream->codecpar);
       zm_dump_codecpar(video_out_stream->codecpar);
 
       video_out_stream->avg_frame_rate = video_in_stream->avg_frame_rate;
@@ -329,6 +338,15 @@ bool VideoStore::open() {
           Debug(1, "Found video codec for %s", chosen_codec_data->codec_name);
 
           video_out_codec = avcodec_find_encoder_by_name(chosen_codec_data->codec_name);
+          if (!video_out_codec) {
+            // This ffmpeg build has no encoder by that name -- common for a hardware
+            // encoder on a box that lacks it. Skip this candidate rather than allocate
+            // a context with a null codec and later dereference video_out_codec->name
+            // when avcodec_open2() fails. If every candidate is missing, video_out_codec
+            // stays null and the passthrough fallback below takes over.
+            Warning("No encoder named %s is available in this ffmpeg build; skipping", chosen_codec_data->codec_name);
+            continue;
+          }
           video_out_ctx = avcodec_alloc_context3(video_out_codec);
           if (oc->oformat->flags & AVFMT_GLOBALHEADER) {
             video_out_ctx->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
@@ -393,6 +411,20 @@ bool VideoStore::open() {
              * the motion of the chroma plane does not match the luma plane. */
             video_out_ctx->mb_decision = 2;
           }
+#if HAVE_LIBAVUTIL_HWCONTEXT_H && LIBAVCODEC_VERSION_CHECK(57, 107, 0, 107, 0)
+          // Borrow the monitor's shared encoder device context rather than
+          // letting setup_hwaccel open the render node again for this event.
+          // Creating and destroying a VAAPI device per event leaked a
+          // /dev/dri/renderD128 fd each time on some drivers (refs #5300). If
+          // the monitor can't provide one, hw_device_ctx stays null and
+          // setup_hwaccel falls back to creating its own.
+          if (chosen_codec_data->hwdevice_type != AV_HWDEVICE_TYPE_NONE) {
+            std::string hw_device = monitor->EncoderHWAccelDevice();
+            if (hw_device.empty() and chosen_codec_data->hwdevice_default)
+              hw_device = chosen_codec_data->hwdevice_default;
+            hw_device_ctx = monitor->GetEncoderHWDeviceContext(chosen_codec_data->hwdevice_type, hw_device);
+          }
+#endif
           if (setup_hwaccel(video_out_ctx,
                 chosen_codec_data, hw_device_ctx, monitor->EncoderHWAccelDevice(), monitor->Width(), monitor->Height())) {
             avcodec_free_context(&video_out_ctx);
@@ -474,6 +506,7 @@ bool VideoStore::open() {
           return false;
         }
         avcodec_parameters_copy(video_out_stream->codecpar, video_in_stream->codecpar);
+        zm_clear_incompatible_codec_tag(oc->oformat, video_out_stream->codecpar);
         video_out_stream->avg_frame_rate = video_in_stream->avg_frame_rate;
         zm_dump_codecpar(video_out_stream->codecpar);
       } else {
@@ -1647,7 +1680,10 @@ int VideoStore::write_packet(AVPacket *pkt, AVStream *stream) {
 
   int ret = av_interleaved_write_frame(oc, pkt);
   if (ret != 0) {
-    Error("Error writing packet: %s", av_make_error_string(ret).c_str());
+    if (packet_write_failures == 0) {
+      Error("Error writing packet: %s", av_make_error_string(ret).c_str());
+    }
+    packet_write_failures++;
   } else {
     Debug(4, "Success writing packet");
   }
@@ -1779,44 +1815,132 @@ void VideoStore::finalize() {
               "before the first frame", filename.c_str());
     }
   }
+
+  if (packet_write_failures > 1) {
+    Warning("%d packets could not be written to %s", packet_write_failures, filename.c_str());
+  }
+}
+
+int VideoStore::m3u8TargetDuration(const std::vector<Fragment> &frags) {
+  double max_duration = 0;
+  for (const auto &frag : frags) {
+    if (frag.duration > max_duration) max_duration = frag.duration;
+  }
+  int target_duration = static_cast<int>(ceil(max_duration));
+  return (target_duration < 1) ? 1 : target_duration;
+}
+
+std::string VideoStore::m3u8Header(int target_duration,
+                                   const std::string &video_url,
+                                   int64_t init_segment_end,
+                                   bool is_complete) {
+  return stringtf("#EXTM3U\n"
+                  "#EXT-X-VERSION:7\n"
+                  "#EXT-X-TARGETDURATION:%d\n"
+                  "#EXT-X-MEDIA-SEQUENCE:0\n"
+                  "#EXT-X-PLAYLIST-TYPE:%s\n"
+                  "#EXT-X-MAP:URI=\"%s\",BYTERANGE=\"%" PRId64 "@0\"\n",
+                  target_duration,
+                  is_complete ? "VOD" : "EVENT",
+                  video_url.c_str(),
+                  init_segment_end);
+}
+
+std::string VideoStore::m3u8Fragment(const Fragment &frag, const std::string &video_url) {
+  return stringtf("#EXTINF:%.3f,\n"
+                  "#EXT-X-BYTERANGE:%" PRId64 "@%" PRId64 "\n"
+                  "%s\n",
+                  frag.duration, frag.size, frag.offset, video_url.c_str());
 }
 
 void VideoStore::writeM3U8(const std::string &m3u8_path, const std::string &video_url, bool is_complete) {
   if (fragments_.empty()) return;
 
-  // Calculate max duration for EXT-X-TARGETDURATION (must be integer, rounded up)
-  double max_duration = 0;
-  for (const auto &frag : fragments_) {
-    if (frag.duration > max_duration) max_duration = frag.duration;
-  }
-  int target_duration = static_cast<int>(ceil(max_duration));
-  if (target_duration < 1) target_duration = 1;
+  const int target_duration = m3u8TargetDuration(fragments_);
 
-  FILE *fp = fopen(m3u8_path.c_str(), "w");
+  // Rewriting the whole manifest for every new fragment costs O(fragments)
+  // each time, so an event pays O(fragments^2) overall. That is free for the
+  // ten minute events a section length produces, and ruinous for anything
+  // longer: a monitor whose events stopped closing reached a 17MB manifest
+  // being rewritten every 1.2s, which saturated the disk, starved the analysis
+  // thread, and so prevented the very close that would have ended it.
+  //
+  // An EVENT playlist only ever gains fragments and never rewrites a line it
+  // has already written, so the new ones can simply go on the end. Anything
+  // that would change what is already there -- a different header, a different
+  // url repeated on every line, or the closing ENDLIST -- falls back to the
+  // full rewrite.
+  bool can_append =
+      !is_complete
+      and (m3u8_fragments_written_ > 0)
+      and (m3u8_fragments_written_ <= fragments_.size())
+      and (target_duration == m3u8_target_duration_)
+      and (init_segment_end_ == m3u8_init_segment_end_)
+      and (video_url == m3u8_video_url_)
+      and (m3u8_path == m3u8_path_);
+
+  if (can_append) {
+    // The offsets we remember only describe the file we left behind. If
+    // anything else has replaced, truncated or removed it, start again rather
+    // than append to something we cannot account for.
+    struct stat st;
+    const bool statted = (stat(m3u8_path.c_str(), &st) == 0);
+    if (!statted or (st.st_size != m3u8_bytes_written_)) {
+      Debug(1, "m3u8 %s is not the file we left (size %jd, expected %jd), rewriting",
+            m3u8_path.c_str(),
+            static_cast<intmax_t>(statted ? st.st_size : -1),
+            static_cast<intmax_t>(m3u8_bytes_written_));
+      can_append = false;
+    } else if (m3u8_fragments_written_ == fragments_.size()) {
+      return;  // nothing new to say
+    }
+  }
+
+  FILE *fp = fopen(m3u8_path.c_str(), can_append ? "a" : "w");
   if (!fp) {
     Error("Failed to open %s for writing: %s", m3u8_path.c_str(), strerror(errno));
+    m3u8_fragments_written_ = 0;
     return;
   }
 
-  fprintf(fp, "#EXTM3U\n");
-  fprintf(fp, "#EXT-X-VERSION:7\n");
-  fprintf(fp, "#EXT-X-TARGETDURATION:%d\n", target_duration);
-  fprintf(fp, "#EXT-X-MEDIA-SEQUENCE:0\n");
-  fprintf(fp, "#EXT-X-PLAYLIST-TYPE:%s\n", is_complete ? "VOD" : "EVENT");
-  fprintf(fp, "#EXT-X-MAP:URI=\"%s\",BYTERANGE=\"%" PRId64 "@0\"\n",
-          video_url.c_str(), init_segment_end_);
+  size_t first = 0;
+  if (can_append) {
+    first = m3u8_fragments_written_;
+  } else {
+    std::string header = m3u8Header(target_duration, video_url, init_segment_end_, is_complete);
+    fwrite(header.c_str(), 1, header.size(), fp);
+  }
 
-  for (const auto &frag : fragments_) {
-    fprintf(fp, "#EXTINF:%.3f,\n", frag.duration);
-    fprintf(fp, "#EXT-X-BYTERANGE:%" PRId64 "@%" PRId64 "\n", frag.size, frag.offset);
-    fprintf(fp, "%s\n", video_url.c_str());
+  for (size_t i = first; i < fragments_.size(); i++) {
+    std::string line = m3u8Fragment(fragments_[i], video_url);
+    fwrite(line.c_str(), 1, line.size(), fp);
   }
 
   if (is_complete) {
     fprintf(fp, "#EXT-X-ENDLIST\n");
   }
 
-  fclose(fp);
-  Debug(1, "Wrote m3u8 %s with %zu fragments (complete=%d)",
-        m3u8_path.c_str(), fragments_.size(), is_complete);
+  const bool ok = (fclose(fp) == 0);
+
+  // Measure the file rather than trusting ftell, so the next call's guard is
+  // comparing against what is really on disk. Anything unreadable leaves the
+  // state zeroed, which forces a rewrite next time.
+  struct stat after;
+  if (ok and !is_complete and (stat(m3u8_path.c_str(), &after) == 0)) {
+    m3u8_fragments_written_ = fragments_.size();
+    m3u8_target_duration_ = target_duration;
+    m3u8_init_segment_end_ = init_segment_end_;
+    m3u8_bytes_written_ = after.st_size;
+    m3u8_path_ = m3u8_path;
+    m3u8_video_url_ = video_url;
+  } else {
+    // A completed manifest ends with ENDLIST; nothing may be appended after
+    // it, so any later call has to rewrite.
+    m3u8_fragments_written_ = 0;
+    if (!ok) Error("Failed to write %s: %s", m3u8_path.c_str(), strerror(errno));
+  }
+
+  Debug(1, "%s m3u8 %s: %zu of %zu fragments (complete=%d)",
+        can_append ? "Appended to" : "Wrote",
+        m3u8_path.c_str(), fragments_.size() - first, fragments_.size(), is_complete);
 }

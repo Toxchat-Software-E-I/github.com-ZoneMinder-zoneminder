@@ -22,11 +22,20 @@ class EventsController extends AppController {
   public function beforeFilter() {
     parent::beforeFilter();
     global $user;
-    $canView = (!$user) || ($user->Events() != 'None');
+    $canView = (!$user) || ($user->canView('Events'));
     if ( !$canView ) {
       throw new UnauthorizedException(__('Insufficient Privileges'));
       return;
     }
+  }
+
+  // The columns of Events and of Tags.Id, the one joined column index() filters on.
+  // Qualify bare Events columns so they aren't ambiguous next to the joins.
+  private function filterColumns() {
+    return array(
+      'Event' => array_keys($this->Event->schema()),
+      'Tags' => array('Id'),
+    );
   }
 
   /**
@@ -81,6 +90,7 @@ class EventsController extends AppController {
       $valid_fields = array_keys($this->Event->schema());
       $valid_fields[] = 'DateTime';
       $valid_fields[] = 'GroupId';
+      $named_params = $this->FilterComponent->qualifyFields($named_params, $this->filterColumns(), array('DateTime', 'GroupId'));
       $conditions = $this->FilterComponent->buildFilter($named_params, $valid_fields);
       #ZM\Debug(print_r($conditions, true));
       # DateTime is a pseudo-attribute meaning "the event was running then", so a
@@ -141,7 +151,8 @@ class EventsController extends AppController {
         $tag_filter_field = 'Name';
         unset($raw_params['Tags']);
       }
-      $conditions = $this->FilterComponent->buildFilter($raw_params);
+      $raw_params = $this->FilterComponent->qualifyFields($raw_params, $this->filterColumns(), array('DateTime', 'GroupId'));
+      $conditions = $this->FilterComponent->buildFilter($raw_params, array_merge(array_keys($this->Event->schema()), array('DateTime', 'GroupId')));
     }
     $settings = array(
       // https://github.com/ZoneMinder/ZoneMinder/issues/995
@@ -261,6 +272,13 @@ class EventsController extends AppController {
 
     $options = array('conditions' => array(array('Event.' . $this->Event->primaryKey => $id), $mon_options));
     $event = $this->Event->find('first', $options);
+    # The event exists (checked above), so an empty result means the monitor
+    # condition filtered it out. Refuse here: an empty ZM\Event has no monitor
+    # and passes canView(), and the code below would then fill in the hidden
+    # event's neighbours and frame ids by $id alone.
+    if (!$event) {
+      throw new UnauthorizedException(__('Insufficient Privileges'));
+    }
     $EventObj = new ZM\Event($event['Event']);
     if (!$EventObj->canView()) {
       throw new UnauthorizedException(__('Insufficient Privileges'));
@@ -315,7 +333,7 @@ class EventsController extends AppController {
   public function add() {
 
     global $user;
-    $canEdit = (!$user) || ($user->Events() == 'Edit');
+    $canEdit = (!$user) || ($user->canEdit('Events'));
     if ( !$canEdit ) {
       throw new UnauthorizedException(__('Insufficient privileges'));
       return;
@@ -347,7 +365,7 @@ class EventsController extends AppController {
   public function edit($id = null) {
 
     global $user;
-    $canEdit = (!$user) || ($user->Events() == 'Edit');
+    $canEdit = (!$user) || ($user->canEdit('Events'));
     if ( !$canEdit ) {
       throw new UnauthorizedException(__('Insufficient privileges'));
       return;
@@ -379,7 +397,7 @@ class EventsController extends AppController {
     if ( $this->Event->save($this->request->data) ) {
       $message = 'Saved';
     } else {
-      $message = 'Error';
+      $message = $this->Event->validationErrors ? $this->Event->validationErrors : 'Error';
     }
 
     $this->set(array(
@@ -397,7 +415,7 @@ class EventsController extends AppController {
    */
   public function delete($id = null) {
     global $user;
-    $canEdit = (!$user) || ($user->Events() == 'Edit');
+    $canEdit = (!$user) || ($user->canEdit('Events'));
     if ( !$canEdit ) {
       throw new UnauthorizedException(__('Insufficient privileges'));
       return;
@@ -440,23 +458,21 @@ class EventsController extends AppController {
       // Transform params into conditions
       if ( preg_match('/^\s?interval\s?/i', $value) ) {
         if (preg_match('/^[a-z0-9]+$/i', $param_name) !== 1) {
-          throw new Exception('Invalid field name: ' . $param_name);
+          throw new BadRequestException('Invalid field name: ' . $param_name);
         }
         $matches = NULL;
         $value = preg_replace('/^\s?interval\s?/i', '', $value);
         if (preg_match('/^(?P<expr>[ \-.:0-9]+)\s+(?P<unit>[_a-z]+)$/i', trim($value), $matches) !== 1) {
-          throw new Exception('Invalid interval: ' . $value);
+          throw new BadRequestException('Invalid interval: ' . $value);
         }
-        $expr = trim($matches['expr']);
-        $unit = trim($matches['unit']);
-        array_push($find_conditions, "$param_name >= DATE_SUB(NOW(), INTERVAL $expr $unit)");
+        $find_conditions[] = "$param_name >= DATE_SUB(NOW(), ".$this->intervalSql($matches['expr'], $matches['unit']).')';
       } else {
         $conditions[$param_name] = $value;
       }
     }
 
     $this->FilterComponent = $this->Components->load('Filter');
-    $conditions = $this->FilterComponent->buildFilter($conditions);
+    $conditions = $this->FilterComponent->buildFilter($conditions, array_keys($this->Event->schema()));
     array_push($conditions, $find_conditions);
     array_push($conditions, $this->viewableMonitorCondition('Event.MonitorId'));
 
@@ -470,6 +486,20 @@ class EventsController extends AppController {
     ));
   } // end public function search
 
+  // The INTERVAL clause for an expression and unit taken from the URL. The unit has to be one
+  // MySQL knows, and the expression is quoted: a compound unit such as DAY_HOUR only takes
+  // a quoted '1 10', and an unknown unit used to come back as a 500 carrying the SQL error.
+  private function intervalSql($expr, $unit) {
+    $units = array('MICROSECOND', 'SECOND', 'MINUTE', 'HOUR', 'DAY', 'WEEK', 'MONTH', 'QUARTER', 'YEAR',
+      'SECOND_MICROSECOND', 'MINUTE_MICROSECOND', 'MINUTE_SECOND', 'HOUR_MICROSECOND', 'HOUR_SECOND',
+      'HOUR_MINUTE', 'DAY_MICROSECOND', 'DAY_SECOND', 'DAY_MINUTE', 'DAY_HOUR', 'YEAR_MONTH');
+    $unit = strtoupper(trim($unit));
+    if (!in_array($unit, $units, true)) {
+      throw new BadRequestException('Invalid interval unit: ' . $unit);
+    }
+    return 'INTERVAL '.$this->Event->getDataSource()->value(trim($expr), 'string')." $unit";
+  }
+
   // format expected:
   // you can changed AlarmFrames to any other named params
   // consoleEvents/1 hour/AlarmFrames >=: 1/AlarmFrames <=: 20.json
@@ -479,20 +509,19 @@ class EventsController extends AppController {
     // https://dev.mysql.com/doc/refman/5.5/en/expressions.html#temporal-intervals
     // Examples: `'1-1' YEAR_MONTH`, `'-1 10' DAY_HOUR`, `'1.999999' SECOND_MICROSECOND`
     if (preg_match('/^(?P<expr>[ \-.:0-9]+)\s+(?P<unit>[_a-z]+)$/i', trim($interval), $matches) !== 1) {
-      throw new Exception('Invalid interval: ' . $interval);
+      throw new BadRequestException('Invalid interval: ' . $interval);
     }
-    $expr = trim($matches['expr']);
-    $unit = trim($matches['unit']);
+    $interval_sql = $this->intervalSql($matches['expr'], $matches['unit']);
 
     $this->Event->recursive = -1;
     $results = array();
     $this->FilterComponent = $this->Components->load('Filter');
     if ( $this->request->params['named'] ) {
-      $conditions = $this->FilterComponent->buildFilter($this->request->params['named']);
+      $conditions = $this->FilterComponent->buildFilter($this->request->params['named'], array_keys($this->Event->schema()));
     } else {
       $conditions = array();
     } 
-    array_push($conditions, array("StartDateTime >= DATE_SUB(NOW(), INTERVAL $expr $unit)"));
+    array_push($conditions, array("StartDateTime >= DATE_SUB(NOW(), $interval_sql)"));
     array_push($conditions, $this->viewableMonitorCondition('Event.MonitorId'));
     $query = $this->Event->find('all', array(
       'fields' => array('MonitorId', 'COUNT(*) AS Count'),
@@ -614,24 +643,8 @@ class EventsController extends AppController {
   }
 
   private function getMaxScoreAlarmFrameId($id = null) {
-    $this->Event->recursive = -1;
-
-    if ( !$this->Event->exists($id) ) {
-      throw new NotFoundException(__('Invalid event'));
-    }
-
-    $event = $this->Event->find('first', array(
-      'conditions' => array('Id' => $id)
-    ));
-
-    // Find the max Frame for this Event.  Error out otherwise.
     $this->loadModel('Frame');
-
-    $frame = $this->Frame->find('first', array(
-      'conditions' => array(
-      'EventId' => $event['Event']['Id'],
-      'Score' => $event['Event']['MaxScore']
-    )));
-    return empty($frame)?null:$frame['Frame']['Id'];
+    $maxScoreFrame = $this->Frame->findByEventid($id, 'FrameId', array('Score'=>'desc','FrameId'=>'asc'));
+    return $maxScoreFrame ? $maxScoreFrame['Frame']['FrameId'] : null;
   }
 } // end class EventsController
